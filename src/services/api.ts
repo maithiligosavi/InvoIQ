@@ -7,6 +7,120 @@ const api = axios.create({
   headers: { 'Content-Type': 'application/json' },
 });
 
+// Attach Authorization: Bearer <token> to every axios request
+api.interceptors.request.use(
+  (config) => {
+    const token = getStoredToken();
+    if (token) {
+      config.headers = config.headers || {};
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+// Intercept 401 Unauthorized responses to clear token and trigger auth modal
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error?.response?.status === 401) {
+      clearAuthSession();
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('invoiq:unauthorized'));
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+
+// Seamlessly attach Authorization: Bearer <token> to native window.fetch requests as well
+if (typeof window !== 'undefined' && window.fetch) {
+  const originalFetch = window.fetch.bind(window);
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const token = getStoredToken();
+    if (token) {
+      init = init ? { ...init } : {};
+      const headers = new Headers(init.headers || {});
+      if (!headers.has('Authorization')) {
+        headers.set('Authorization', `Bearer ${token}`);
+      }
+      init.headers = headers;
+    }
+    return originalFetch(input, init);
+  };
+}
+
+// -------------------------------------------------------------
+// Auth Helpers & Storage
+// -------------------------------------------------------------
+
+export function getStoredToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  return localStorage.getItem('token') || localStorage.getItem('access_token');
+}
+
+export function getStoredUsername(): string | null {
+  if (typeof window === 'undefined') return null;
+  return localStorage.getItem('username');
+}
+
+export function saveAuthSession(token: string, username?: string): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem('token', token);
+  localStorage.setItem('access_token', token);
+  if (username) {
+    localStorage.setItem('username', username);
+  }
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('invoiq:auth_changed', { detail: { token, username } }));
+  }
+}
+
+export function clearAuthSession(): void {
+  if (typeof window === 'undefined') return;
+  localStorage.removeItem('token');
+  localStorage.removeItem('access_token');
+  localStorage.removeItem('username');
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('invoiq:auth_changed', { detail: { token: null, username: null } }));
+  }
+}
+
+export interface AuthResponse {
+  access_token: string;
+  token_type: string;
+  username: string;
+  message?: string;
+}
+
+export async function loginUser(username: string, password: string): Promise<AuthResponse> {
+  const { data } = await api.post<AuthResponse>('/token', {
+    username: username.trim(),
+    password,
+  });
+  saveAuthSession(data.access_token, data.username);
+  return data;
+}
+
+export async function registerUser(username: string, password: string): Promise<AuthResponse> {
+  const { data } = await api.post<AuthResponse>('/register', {
+    username: username.trim(),
+    password,
+  });
+  saveAuthSession(data.access_token, data.username);
+  return data;
+}
+
+export async function fetchCurrentUser(): Promise<{ id: number; username: string }> {
+  const { data } = await api.get<{ id: number; username: string }>('/me');
+  return data;
+}
+
+// -------------------------------------------------------------
+// Existing Protected Invoice APIs
+// -------------------------------------------------------------
+
 export async function fetchInvoices(): Promise<Invoice[]> {
   const { data } = await api.get<Invoice[]>('/invoices');
   return data;

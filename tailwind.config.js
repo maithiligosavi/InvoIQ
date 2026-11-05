@@ -16,6 +16,13 @@ export default {
           800: '#1e40af',
           900: '#1e3a8a',
         },
+        warm: {
+          bg: '#FFF5F5',
+          card: '#F7D6D0',
+          accent: '#E2B4BD',
+          accentHover: '#D49DA7',
+          text: '#4A4A4A',
+        },
       },
       fontFamily: {
         sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],

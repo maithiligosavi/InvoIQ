@@ -1,9 +1,12 @@
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from typing import Optional
 import database
 import models
 import parser
+import auth
 
 # Initialize FastAPI app
 app = FastAPI(title="DocuFlow Backend", version="1.0")
@@ -25,8 +28,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Create database tables on startup
+# Create database tables on startup (creates 'users' and 'invoices' tables if not present)
 models.Base.metadata.create_all(bind=database.engine)
+
+
+# Pydantic models for authentication
+class UserAuthRequest(BaseModel):
+    username: str
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    username: str
+
 
 @app.get("/")
 def root():
@@ -35,19 +50,168 @@ def root():
         "service": "DocuFlow Backend API",
         "docs": "/docs",
         "endpoints": {
+            "register": "/api/register",
+            "token": "/api/token",
             "invoices": "/api/invoices",
             "analytics": "/api/analytics",
             "upload": "/api/upload"
         }
     }
 
+
 @app.get("/health")
 def health():
     return {"status": "healthy"}
 
+
+# ---------------------------------------------------------
+# AUTHENTICATION ENDPOINTS
+# ---------------------------------------------------------
+
+@app.post("/api/register")
+async def register(request: Request, db: Session = Depends(database.get_db)):
+    content_type = request.headers.get("content-type", "").lower()
+    username = None
+    password = None
+
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+            username = body.get("username")
+            password = body.get("password")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    else:
+        try:
+            form = await request.form()
+            username = form.get("username")
+            password = form.get("password")
+        except Exception:
+            pass
+        if not username and not password:
+            try:
+                body = await request.json()
+                username = body.get("username")
+                password = body.get("password")
+            except Exception:
+                pass
+
+    if not username or not password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username and password are required"
+        )
+
+    clean_username = str(username).strip()
+    clean_password = str(password)
+
+    if len(clean_username) < 3:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username must be at least 3 characters long"
+        )
+    if len(clean_password) < 4:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 4 characters long"
+        )
+
+    existing_user = db.query(models.UserModel).filter(models.UserModel.username == clean_username).first()
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username is already registered"
+        )
+
+    hashed_pw = auth.get_password_hash(clean_password)
+    new_user = models.UserModel(username=clean_username, password_hash=hashed_pw)
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    access_token = auth.create_access_token(data={"sub": new_user.username})
+    return {
+        "message": "User registered successfully",
+        "access_token": access_token,
+        "token_type": "bearer",
+        "username": new_user.username
+    }
+
+
+@app.post("/api/token", response_model=TokenResponse)
+@app.post("/api/login", response_model=TokenResponse)
+async def login_for_access_token(request: Request, db: Session = Depends(database.get_db)):
+    content_type = request.headers.get("content-type", "").lower()
+    username = None
+    password = None
+
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+            username = body.get("username")
+            password = body.get("password")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    else:
+        try:
+            form = await request.form()
+            username = form.get("username")
+            password = form.get("password")
+        except Exception:
+            pass
+        if not username and not password:
+            try:
+                body = await request.json()
+                username = body.get("username")
+                password = body.get("password")
+            except Exception:
+                pass
+
+    if not username or not password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username and password are required"
+        )
+
+    clean_username = str(username).strip()
+    clean_password = str(password)
+
+    user = db.query(models.UserModel).filter(models.UserModel.username == clean_username).first()
+    if not user or not auth.verify_password(clean_password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    access_token = auth.create_access_token(data={"sub": user.username})
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "username": user.username
+    }
+
+
+@app.get("/api/me")
+def get_current_user_profile(current_user: models.UserModel = Depends(auth.get_current_user)):
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "created_at": current_user.created_at.isoformat() if current_user.created_at else None
+    }
+
+
+# ---------------------------------------------------------
+# PROTECTED INVOICE ENDPOINTS
+# ---------------------------------------------------------
+
 # 1. Endpoint to Upload and Parse PDF Invoices
 @app.post("/api/upload")
-async def upload_invoice(file: UploadFile = File(...), db: Session = Depends(database.get_db)):
+async def upload_invoice(
+    file: UploadFile = File(...),
+    db: Session = Depends(database.get_db),
+    current_user: models.UserModel = Depends(auth.get_current_user)
+):
     if not (file.filename and file.filename.lower().endswith(".pdf")):
         raise HTTPException(status_code=400, detail="File type not supported must be a valid invoice")
     
@@ -73,7 +237,7 @@ async def upload_invoice(file: UploadFile = File(...), db: Session = Depends(dat
     except Exception:
         raise HTTPException(status_code=400, detail="File type not supported must be a valid invoice")
 
-    # Run through your Python PDF parser
+    # Run through your Python PDF parser (unaltered)
     parsed_data = parser.parse_invoice_pdf(file_bytes)
     if parsed_data.get("status") == "Failed":
         detail_msg = parsed_data.get("error_message") or "File type not supported must be a valid invoice"
@@ -132,9 +296,13 @@ async def upload_invoice(file: UploadFile = File(...), db: Session = Depends(dat
         **formatted_invoice
     }
 
+
 # 2. Endpoint to Get All Invoices for the Dashboard Table
 @app.get("/api/invoices")
-def get_invoices(db: Session = Depends(database.get_db)):
+def get_invoices(
+    db: Session = Depends(database.get_db),
+    current_user: models.UserModel = Depends(auth.get_current_user)
+):
     invoices = db.query(models.InvoiceModel).all()
     return [
         {
@@ -159,9 +327,14 @@ def get_invoices(db: Session = Depends(database.get_db)):
         for inv in invoices
     ]
 
+
 # 3. Endpoint to Delete an Invoice
 @app.delete("/api/invoices/{invoice_id}")
-def delete_invoice(invoice_id: str, db: Session = Depends(database.get_db)):
+def delete_invoice(
+    invoice_id: str,
+    db: Session = Depends(database.get_db),
+    current_user: models.UserModel = Depends(auth.get_current_user)
+):
     clean_id = invoice_id.strip()
     inv = None
 
@@ -184,9 +357,13 @@ def delete_invoice(invoice_id: str, db: Session = Depends(database.get_db)):
     db.commit()
     return {"message": "Invoice deleted successfully", "id": invoice_id}
 
+
 # 4. Endpoint to Get Analytics Metrics and Totals
 @app.get("/api/analytics")
-def get_analytics(db: Session = Depends(database.get_db)):
+def get_analytics(
+    db: Session = Depends(database.get_db),
+    current_user: models.UserModel = Depends(auth.get_current_user)
+):
     invoices = db.query(models.InvoiceModel).all()
     
     processed = [inv for inv in invoices if inv.status == "Processed"]
