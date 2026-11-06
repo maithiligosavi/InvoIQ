@@ -136,15 +136,12 @@ export async function deleteInvoice(invoiceId: string): Promise<{ message: strin
   return data;
 }
 
-export async function uploadInvoice(file: File): Promise<{
-  progress: number;
-  extracted: ExtractedInvoice;
-  invoice: Invoice;
-}> {
+/** Parse a PDF invoice and return extracted fields — does NOT save to DB. */
+export async function parseInvoice(file: File): Promise<ExtractedInvoice> {
   const formData = new FormData();
   formData.append('file', file);
 
-  const { data } = await api.post('/upload', formData, {
+  const { data } = await api.post<ExtractedInvoice>('/parse', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
     onUploadProgress: (event) => {
       if (event.total) {
@@ -154,58 +151,63 @@ export async function uploadInvoice(file: File): Promise<{
     },
   });
 
-  // Unpack data from response (handles { data: {...} } or root fields)
-  const raw = (data && data.data) ? data.data : data;
-
-  const vendor = raw.vendor || raw.vendorName || raw.vendor_name || 'Unknown Vendor';
-  const invoiceNumber = raw.invoiceId || raw.invoiceNumber || raw.invoice_number || 'INV-001';
-  const invoiceDate = raw.date || raw.invoice_date || new Date().toISOString().split('T')[0];
-  const totalAmount = Number(raw.amount ?? raw.totalAmount ?? raw.total_amount ?? 0);
-  const gst = Number(raw.gst ?? Math.round(totalAmount * 0.18));
-  const currency = raw.currency || 'INR';
-  const status = (raw.status === 'Pending' || raw.status === 'Failed') ? raw.status : 'Processed';
-  const id = raw.id ? String(raw.id) : `INV-${Date.now()}`;
-
-  const lineItems = (raw.lineItems && raw.lineItems.length > 0)
-    ? raw.lineItems
+  const vendor = data.vendorName || 'Unknown Vendor';
+  const invoiceNumber = data.invoiceNumber || '';
+  const invoiceDate = data.date || new Date().toISOString().split('T')[0];
+  const totalAmount = Number(data.totalAmount ?? 0);
+  const gst = Number((data as any).gst ?? Math.round(totalAmount * 0.18));
+  const currency = data.currency || 'INR';
+  const lineItems = (data.lineItems && data.lineItems.length > 0)
+    ? data.lineItems
     : [
-        {
-          description: `${vendor} Service`,
-          quantity: 1,
-          unitPrice: Math.round(totalAmount * 0.82),
-          total: Math.round(totalAmount * 0.82),
-        },
-        {
-          description: 'GST 18%',
-          quantity: 1,
-          unitPrice: gst,
-          total: gst,
-        },
+        { description: `${vendor} Service`, quantity: 1, unitPrice: Math.round(totalAmount * 0.82), total: Math.round(totalAmount * 0.82) },
+        { description: 'GST 18%', quantity: 1, unitPrice: gst, total: gst },
       ];
 
-  const extracted: ExtractedInvoice = {
-    vendorName: vendor,
-    invoiceNumber,
-    date: invoiceDate,
-    totalAmount,
-    currency,
-    gst,
-    lineItems,
-  };
+  return { vendorName: vendor, invoiceNumber, date: invoiceDate, totalAmount, currency, gst, lineItems };
+}
 
-  const invoice: Invoice = {
+/** Persist a (possibly user-edited) ExtractedInvoice to the database and return the saved Invoice. */
+export async function saveInvoice(extracted: ExtractedInvoice): Promise<Invoice> {
+  const { data } = await api.post<Invoice & { id: string; vendor: string; invoiceId: string; amount: number; status: string; category: string }>('/invoices', {
+    vendorName: extracted.vendorName,
+    invoiceNumber: extracted.invoiceNumber,
+    date: extracted.date,
+    totalAmount: extracted.totalAmount,
+    gst: extracted.gst,
+    taxAmount: extracted.gst,
+    currency: extracted.currency,
+    lineItems: extracted.lineItems,
+  });
+
+  const id = (data as any).id ? String((data as any).id) : `INV-${Date.now()}`;
+  const vendor = (data as any).vendor || extracted.vendorName;
+  const invoiceId = (data as any).invoiceId || extracted.invoiceNumber;
+  const amount = Number((data as any).amount ?? extracted.totalAmount);
+  const status = ((data as any).status === 'Pending' || (data as any).status === 'Failed') ? (data as any).status : 'Processed';
+
+  return {
     id,
     vendor,
-    invoiceId: invoiceNumber,
-    date: invoiceDate,
-    amount: totalAmount,
+    invoiceId,
+    date: extracted.date,
+    amount,
     status,
-    category: raw.category || 'General',
-    currency,
-    gst,
-    lineItems,
+    category: (data as any).category || 'General',
+    currency: extracted.currency,
+    gst: extracted.gst,
+    lineItems: extracted.lineItems,
   };
+}
 
+/** @deprecated Use parseInvoice + saveInvoice instead. Kept for compatibility. */
+export async function uploadInvoice(file: File): Promise<{
+  progress: number;
+  extracted: ExtractedInvoice;
+  invoice: Invoice;
+}> {
+  const extracted = await parseInvoice(file);
+  const invoice = await saveInvoice(extracted);
   return { progress: 100, extracted, invoice };
 }
 

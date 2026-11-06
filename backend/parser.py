@@ -1,8 +1,13 @@
 import io
+import json
 import re
 from datetime import datetime
 from pypdf import PdfReader
 
+
+# ============================================================
+# VENDOR DETECTION
+# ============================================================
 
 def extract_vendor_name(text: str) -> str:
     """
@@ -72,6 +77,10 @@ def extract_vendor_name(text: str) -> str:
     return "Unknown Vendor"
 
 
+# ============================================================
+# INVOICE / ORDER NUMBER
+# ============================================================
+
 def extract_order_or_invoice_number(text: str) -> str | None:
     """
     Extract order ID or invoice number using platform-specific and generic regex.
@@ -110,9 +119,30 @@ def extract_order_or_invoice_number(text: str) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------- #
-# Grand-total extraction helpers                                           #
-# ---------------------------------------------------------------------- #
+# ============================================================
+# SEPARATE ORDER NUMBER (PO / Reference)
+# ============================================================
+
+def extract_order_number(text: str) -> str | None:
+    """
+    Extract an explicit purchase-order / reference number separate from the invoice number.
+    Returns None if not found.
+    """
+    patterns = [
+        r"(?:P\.?O\.?\s*(?:Number|No\.?|#)|Purchase\s*Order\s*(?:No\.?|Number|#)|Reference\s*(?:No\.?|Number|#))\s*[:\-\s#]\s*([A-Za-z0-9][A-Za-z0-9\-_/]{1,})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            val = match.group(1).strip(" .,:;-_#")
+            if val:
+                return val
+    return None
+
+
+# ============================================================
+# GRAND-TOTAL EXTRACTION HELPERS
+# ============================================================
 
 # Currency amount (Indian & Western formats): 1,538.00 | 1,12,500.00 | 499 | 12345.5
 _NUM = (
@@ -257,9 +287,14 @@ def extract_grand_total(text: str) -> float | None:
     return None
 
 
-def extract_invoice_date(text: str) -> str:
+# ============================================================
+# INVOICE DATE
+# ============================================================
+
+def extract_invoice_date(text: str) -> str | None:
     """
-    Extract invoice or order date. Fallback to current date (YYYY-MM-DD).
+    Extract invoice or order date.
+    Returns ISO YYYY-MM-DD string, or None if not found.
     """
     date_patterns = [
         # DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
@@ -280,95 +315,465 @@ def extract_invoice_date(text: str) -> str:
                 return f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
             return raw_date
 
-    return datetime.now().strftime("%Y-%m-%d")
+    return None
 
+
+# ============================================================
+# DUE DATE
+# ============================================================
+
+def extract_due_date(text: str) -> str | None:
+    """
+    Extract the payment due date. Returns ISO YYYY-MM-DD string, or None.
+    """
+    patterns = [
+        r"(?:Due\s*Date|Payment\s*Due|Pay\s*By|Due\s*By)\s*[:\-\s]*\s*([0-9]{1,2}[./-][0-9]{1,2}[./-][0-9]{2,4})",
+        r"(?:Due\s*Date|Payment\s*Due|Pay\s*By|Due\s*By)\s*[:\-\s]*\s*([0-9]{4}[./-][0-9]{1,2}[./-][0-9]{1,2})",
+        r"(?:Due\s*Date|Payment\s*Due|Pay\s*By|Due\s*By)\s*[:\-\s]*\s*([0-9]{1,2}\s+[A-Za-z]{3,9}\s+[0-9]{2,4})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            raw_date = match.group(1).strip()
+            clean_date = raw_date.replace(".", "/").replace("-", "/")
+            parts = clean_date.split("/")
+            if len(parts) == 3 and len(parts[0]) <= 2 and len(parts[2]) == 4:
+                return f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+            return raw_date
+    return None
+
+
+# ============================================================
+# CURRENCY
+# ============================================================
+
+def extract_currency(text: str) -> str:
+    """
+    Detect the ISO 4217 currency code from the invoice text.
+    Defaults to 'INR' if none detected.
+    """
+    if re.search(r"\bUSD\b|\$(?!\s*[0-9]*\s*(?:crore|lakh|k\b))", text, re.IGNORECASE):
+        return "USD"
+    if re.search(r"\bEUR\b|€", text):
+        return "EUR"
+    if re.search(r"\bGBP\b|£", text):
+        return "GBP"
+    if re.search(r"\bAED\b", text, re.IGNORECASE):
+        return "AED"
+    if re.search(r"\bSGD\b", text, re.IGNORECASE):
+        return "SGD"
+    # INR indicators: ₹ symbol, Rs., INR keyword
+    if re.search(r"₹|Rs\.?|INR\b", text, re.IGNORECASE):
+        return "INR"
+    return "INR"
+
+
+# ============================================================
+# SUBTOTAL
+# ============================================================
+
+def extract_subtotal(text: str) -> float | None:
+    """
+    Extract the subtotal / item total (before taxes & shipping).
+    Returns None if not found.
+    """
+    patterns = [
+        r"(?:Sub\s*[-]?\s*Total|Item\s+Total|Taxable\s+(?:Value|Amount)|Net\s+Amount)\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([0-9,]+(?:\.[0-9]{1,2})?)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                return round(float(match.group(1).replace(",", "")), 2)
+            except ValueError:
+                continue
+    return None
+
+
+# ============================================================
+# TAX AMOUNT (TOTAL GST)
+# ============================================================
+
+def extract_tax_amount(text: str) -> float | None:
+    """
+    Extract total tax / GST amount paid.
+    Returns None if not found.
+    """
+    patterns = [
+        r"(?:Total\s+Tax|Tax\s+Amount|Tax\s+Total|Total\s+GST|GST\s+Total|Total\s+GST\s+Amount)\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([0-9,]+(?:\.[0-9]{1,2})?)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                return round(float(match.group(1).replace(",", "")), 2)
+            except ValueError:
+                continue
+
+    # Fallback: sum up individual CGST + SGST amounts if no total tax line found
+    tax_breakup = extract_tax_breakup(text)
+    if tax_breakup:
+        total = sum(v for v in tax_breakup.values() if isinstance(v, (int, float)))
+        if total > 0:
+            return round(total, 2)
+
+    return None
+
+
+# ============================================================
+# TAX BREAKUP (CGST / SGST / IGST)
+# ============================================================
+
+def extract_tax_breakup(text: str) -> dict | None:
+    """
+    Extract individual GST component amounts (CGST, SGST, IGST, UGST).
+    Returns a dict like {"CGST_9": 45.0, "SGST_9": 45.0} or None if none found.
+    Keys are formatted as "COMPONENT_RATE" where rate is the percentage.
+    """
+    result: dict = {}
+
+    # Pattern: "CGST @ 9% : Rs. 45.00" or "CGST (9%) 45.00" or "CGST 9% 45.00"
+    gst_pattern = re.compile(
+        r"\b(CGST|SGST|IGST|UGST|UTGST)\b"
+        r"(?:\s*[@(]?\s*([0-9]+(?:\.[0-9]+)?)\s*%\s*[):]?)?"
+        r"\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([0-9,]+(?:\.[0-9]{1,2})?)",
+        re.IGNORECASE,
+    )
+
+    for match in gst_pattern.finditer(text):
+        component = match.group(1).upper()
+        rate = match.group(2)        # may be None
+        amount_str = match.group(3)
+        try:
+            amount = float(amount_str.replace(",", ""))
+        except (ValueError, AttributeError):
+            continue
+        if amount <= 0:
+            continue
+        key = f"{component}_{rate}" if rate else component
+        # If the same key appears multiple times, accumulate (multi-line invoices)
+        result[key] = round(result.get(key, 0.0) + amount, 2)
+
+    return result if result else None
+
+
+# ============================================================
+# DISCOUNT
+# ============================================================
+
+def extract_discount(text: str) -> float | None:
+    """
+    Extract discount amount. Returns None if not found.
+    """
+    patterns = [
+        r"(?:Discount|Coupon\s*Discount|Promo\s*Discount|Total\s+Discount)\s*[:\-]?\s*(?:₹|Rs\.?|INR|-)?\s*([0-9,]+(?:\.[0-9]{1,2})?)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                val = float(match.group(1).replace(",", ""))
+                if val > 0:
+                    return round(val, 2)
+            except ValueError:
+                continue
+    return None
+
+
+# ============================================================
+# SHIPPING CHARGES
+# ============================================================
+
+def extract_shipping_charges(text: str) -> float | None:
+    """
+    Extract shipping / delivery / handling charges. Returns None if not found.
+    """
+    patterns = [
+        r"(?:Shipping\s*(?:Charges?|Fee|Fees|Cost)?|Delivery\s*(?:Charges?|Fee|Fees|Cost)?|Handling\s*(?:Charges?|Fee|Fees)?|Freight)\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([0-9,]+(?:\.[0-9]{1,2})?)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                val = float(match.group(1).replace(",", ""))
+                if val > 0:
+                    return round(val, 2)
+            except ValueError:
+                continue
+    return None
+
+
+# ============================================================
+# PAYMENT STATUS / METHOD
+# ============================================================
+
+def extract_payment_status_or_method(text: str) -> str | None:
+    """
+    Extract payment status (Paid, Unpaid, Pending) or method (COD, UPI, Card, etc.).
+    Returns None if not found.
+    """
+    text_lower = text.lower()
+
+    # Payment status keywords
+    if re.search(r"\bpaid\b", text_lower):
+        return "Paid"
+    if re.search(r"\bunpaid\b", text_lower):
+        return "Unpaid"
+    if re.search(r"\bpending\b", text_lower):
+        return "Pending"
+
+    # Payment method keywords
+    method_patterns = [
+        (r"\bcod\b|cash\s*on\s*delivery", "COD"),
+        (r"\bupi\b", "UPI"),
+        (r"\bnet\s*banking\b|netbanking", "Net Banking"),
+        (r"\bdebit\s*card\b", "Debit Card"),
+        (r"\bcredit\s*card\b", "Credit Card"),
+        (r"\bwallet\b", "Wallet"),
+        (r"\bneft\b|\brtgs\b|\bimps\b", "Bank Transfer"),
+        (r"\bcheque\b|\bcheck\b", "Cheque"),
+        (r"\bcash\b", "Cash"),
+    ]
+    for pattern, label in method_patterns:
+        if re.search(pattern, text_lower):
+            return label
+
+    # Labeled extraction
+    labeled_match = re.search(
+        r"(?:Payment\s*(?:Method|Mode|Status|Terms?)|Mode\s*of\s*Payment)\s*[:\-]\s*([^\r\n]{2,30})",
+        text,
+        re.IGNORECASE,
+    )
+    if labeled_match:
+        val = labeled_match.group(1).strip()
+        if val:
+            return val[:30]
+
+    return None
+
+
+# ============================================================
+# LINE ITEMS
+# ============================================================
+
+def extract_line_items(text: str) -> list[dict] | None:
+    """
+    Extract line items from invoice text as a list of dicts with keys:
+      description, quantity, unit_price, line_total
+    Returns None if no items could be parsed.
+
+    Handles patterns like:
+      "Item Description   Qty   Unit Price   Total"
+      "Wireless Mouse  1  Rs. 499.00  Rs. 499.00"
+      "Item: X  Price: Rs. 499.00  Total: Rs. 499.00"
+    """
+    items: list[dict] = []
+
+    # Pattern 1: Labeled "Item: X  Price: Rs. N  Total: Rs. N"
+    labeled_re = re.compile(
+        r"(?:Item|Product|Description)\s*:\s*(.+?)"
+        r"(?:\s+(?:Qty|Quantity)\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?))?"
+        r"\s+(?:Unit\s*Price|Price|Rate)\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([0-9,]+(?:\.[0-9]{1,2})?)"
+        r"(?:\s+(?:Total|Amount|Line\s+Total)\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([0-9,]+(?:\.[0-9]{1,2})?))?",
+        re.IGNORECASE,
+    )
+    for m in labeled_re.finditer(text):
+        try:
+            desc = m.group(1).strip()
+            qty_str = m.group(2)
+            price_str = m.group(3)
+            total_str = m.group(4)
+            qty = float(qty_str) if qty_str else 1.0
+            unit_price = float(price_str.replace(",", "")) if price_str else 0.0
+            line_total = float(total_str.replace(",", "")) if total_str else round(qty * unit_price, 2)
+            if desc and unit_price > 0:
+                items.append({
+                    "description": desc[:80],
+                    "quantity": qty,
+                    "unit_price": unit_price,
+                    "line_total": line_total,
+                })
+        except (ValueError, AttributeError):
+            continue
+
+    if items:
+        return items
+
+    # Pattern 2: Tabular lines — "Description  Qty  UnitPrice  Total" layout
+    # Heuristic: look for lines with 2–4 numeric columns (qty, price, total)
+    tabular_re = re.compile(
+        r"^(.{3,40}?)\s{2,}"                       # description (at least 3 chars, then 2+ spaces)
+        r"([0-9]+(?:\.[0-9]+)?)\s+"                # quantity
+        r"(?:₹|Rs\.?|INR)?\s*([0-9,]+\.[0-9]{2})\s+"  # unit price (must have decimals)
+        r"(?:₹|Rs\.?|INR)?\s*([0-9,]+\.[0-9]{2})",    # line total (must have decimals)
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for m in tabular_re.finditer(text):
+        try:
+            desc = m.group(1).strip()
+            qty = float(m.group(2))
+            unit_price = float(m.group(3).replace(",", ""))
+            line_total = float(m.group(4).replace(",", ""))
+            # Skip lines that are clearly summary rows
+            if re.search(r"\b(?:total|grand|subtotal|tax|gst|cgst|sgst|igst|discount|shipping)\b", desc, re.IGNORECASE):
+                continue
+            if desc and unit_price > 0:
+                items.append({
+                    "description": desc[:80],
+                    "quantity": qty,
+                    "unit_price": unit_price,
+                    "line_total": line_total,
+                })
+        except (ValueError, AttributeError):
+            continue
+
+    return items if items else None
+
+
+# ============================================================
+# MAIN PARSER ENTRY POINT
+# ============================================================
 
 def parse_invoice_pdf(file_bytes: bytes) -> dict:
     """
-    Parses PDF bytes to extract vendor name, invoice/order number, date, and grand total.
-    Handles e-commerce invoices (Amazon, Flipkart, Meesho, etc.) and provides robust
-    fallback and error resilience.
+    Parses PDF bytes to extract all invoice fields with graceful null/fallback
+    handling. Never raises — always returns a dict with a 'status' key.
+
+    Extracted fields:
+      vendor_name, invoice_number, invoice_date, total_amount, currency,
+      tax_amount, subtotal, tax_breakup, discount, shipping_charges,
+      due_date, order_number, payment_status_or_method, line_items,
+      status, error_message
     """
+
+    # Build a base "failed" response with all fields set to their safe defaults
+    _null_response = {
+        "vendor_name": None,
+        "invoice_number": None,
+        "invoice_date": None,
+        "total_amount": None,
+        "currency": "INR",
+        "tax_amount": None,
+        "subtotal": None,
+        "tax_breakup": None,
+        "discount": None,
+        "shipping_charges": None,
+        "due_date": None,
+        "order_number": None,
+        "payment_status_or_method": None,
+        "line_items": None,
+        "status": "Failed",
+        "error_message": None,
+    }
+
     try:
-        # Read PDF binary stream from memory
         reader = PdfReader(io.BytesIO(file_bytes))
 
         if len(reader.pages) == 0:
             return {
+                **_null_response,
                 "vendor_name": "Unknown Vendor",
                 "invoice_number": "N/A",
                 "invoice_date": "N/A",
                 "total_amount": 0.0,
-                "currency": "₹",
-                "status": "Failed",
-                "error_message": "PDF contains no pages."
+                "error_message": "PDF contains no pages.",
             }
 
         extracted_text = ""
-        # Loop through pages and extract text
         for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                extracted_text += text + "\n"
+            try:
+                text = page.extract_text()
+                if text:
+                    extracted_text += text + "\n"
+            except Exception:
+                # Skip unreadable pages rather than failing the whole parse
+                continue
 
-        # Check for empty text layer (scanned or image-only PDF)
         if not extracted_text or not extracted_text.strip():
             return {
+                **_null_response,
                 "vendor_name": "Unknown Vendor",
                 "invoice_number": "N/A",
                 "invoice_date": "N/A",
                 "total_amount": 0.0,
-                "currency": "₹",
-                "status": "Failed",
-                "error_message": "PDF has an empty text layer or is a scanned image without readable text."
+                "error_message": "PDF has an empty text layer or is a scanned image without readable text.",
             }
 
-        # 1. Vendor Recognition
-        vendor_name = extract_vendor_name(extracted_text)
+        # --- Field extraction (each wrapped so one failure won't crash the rest) ---
 
-        # 2. Platform-Specific Order / Invoice Number
-        invoice_number = extract_order_or_invoice_number(extracted_text)
+        def _safe(fn, *args, default=None):
+            """Call fn(*args) and return default on any exception."""
+            try:
+                return fn(*args)
+            except Exception:
+                return default
 
-        # 3. Robust Grand Total Extraction
-        total_amount = extract_grand_total(extracted_text)
+        vendor_name             = _safe(extract_vendor_name,              extracted_text, default="Unknown Vendor")
+        invoice_number          = _safe(extract_order_or_invoice_number,  extracted_text)
+        invoice_date            = _safe(extract_invoice_date,             extracted_text)
+        total_amount            = _safe(extract_grand_total,              extracted_text)
+        currency                = _safe(extract_currency,                 extracted_text, default="INR")
+        tax_amount              = _safe(extract_tax_amount,               extracted_text)
+        subtotal                = _safe(extract_subtotal,                 extracted_text)
+        tax_breakup             = _safe(extract_tax_breakup,              extracted_text)
+        discount                = _safe(extract_discount,                 extracted_text)
+        shipping_charges        = _safe(extract_shipping_charges,         extracted_text)
+        due_date                = _safe(extract_due_date,                 extracted_text)
+        order_number            = _safe(extract_order_number,             extracted_text)
+        payment_status_or_method = _safe(extract_payment_status_or_method, extracted_text)
+        line_items              = _safe(extract_line_items,               extracted_text)
 
-        # 4. Invoice Date Extraction
-        invoice_date = extract_invoice_date(extracted_text)
-
-        # 5. Check if pattern matching failed
+        # If total_amount could not be found, the invoice is not processable
         if total_amount is None:
             return {
+                **_null_response,
                 "vendor_name": vendor_name,
                 "invoice_number": invoice_number or "N/A",
                 "invoice_date": invoice_date or "N/A",
                 "total_amount": 0.0,
-                "currency": "₹",
-                "status": "Failed",
-                "error_message": "Pattern matching failed: unable to locate Grand Total or Amount Due in invoice."
+                "currency": currency,
+                "tax_amount": tax_amount,
+                "subtotal": subtotal,
+                "tax_breakup": tax_breakup,
+                "discount": discount,
+                "shipping_charges": shipping_charges,
+                "due_date": due_date,
+                "order_number": order_number,
+                "payment_status_or_method": payment_status_or_method,
+                "line_items": line_items,
+                "error_message": "Pattern matching failed: unable to locate Grand Total or Amount Due in invoice.",
             }
 
-        # If invoice number wasn't found but total was, provide an auto-generated fallback ID
+        # Auto-generate invoice number if none was found but total was
         if not invoice_number:
             invoice_number = f"INV-{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
         return {
             "vendor_name": vendor_name,
             "invoice_number": invoice_number,
-            "invoice_date": invoice_date,
+            "invoice_date": invoice_date or datetime.now().strftime("%Y-%m-%d"),
             "total_amount": total_amount,
-            "currency": "₹",
+            "currency": currency,
+            "tax_amount": tax_amount,
+            "subtotal": subtotal,
+            "tax_breakup": tax_breakup,
+            "discount": discount,
+            "shipping_charges": shipping_charges,
+            "due_date": due_date,
+            "order_number": order_number,
+            "payment_status_or_method": payment_status_or_method,
+            "line_items": line_items,
             "status": "Processed",
-            "error_message": None
+            "error_message": None,
         }
 
     except Exception as e:
-        # Gracefully catch all parsing exceptions rather than crashing backend
+        # Catch-all: never crash the backend
         return {
+            **_null_response,
             "vendor_name": "Parsing Error",
             "invoice_number": "N/A",
             "invoice_date": "N/A",
             "total_amount": 0.0,
-            "currency": "₹",
-            "status": "Failed",
-            "error_message": f"Failed to parse invoice PDF: {str(e)}"
+            "error_message": f"Failed to parse invoice PDF: {str(e)}",
         }

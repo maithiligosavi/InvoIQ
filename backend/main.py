@@ -32,6 +32,32 @@ app.add_middleware(
 models.Base.metadata.create_all(bind=database.engine)
 
 
+def init_db():
+    try:
+        import sqlite3
+        conn = sqlite3.connect(database.DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(invoices);")
+        columns = [col[1] for col in cursor.fetchall()]
+        if columns and "user_id" not in columns:
+            cursor.execute("ALTER TABLE invoices ADD COLUMN user_id INTEGER;")
+            cursor.execute("UPDATE invoices SET user_id = 1 WHERE user_id IS NULL;")
+            conn.commit()
+
+        cursor.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='ix_invoices_invoice_number';")
+        idx_row = cursor.fetchone()
+        if idx_row and idx_row[0] and "UNIQUE" in idx_row[0].upper():
+            cursor.execute("DROP INDEX IF EXISTS ix_invoices_invoice_number;")
+            cursor.execute("CREATE INDEX IF NOT EXISTS ix_invoices_invoice_number ON invoices (invoice_number);")
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Database schema initialization warning: {e}")
+
+
+init_db()
+
+
 # Pydantic models for authentication
 class UserAuthRequest(BaseModel):
     username: str
@@ -205,7 +231,178 @@ def get_current_user_profile(current_user: models.UserModel = Depends(auth.get_c
 # PROTECTED INVOICE ENDPOINTS
 # ---------------------------------------------------------
 
-# 1. Endpoint to Upload and Parse PDF Invoices
+# 1a. Parse-only endpoint — extracts fields from PDF but does NOT save to DB
+@app.post("/api/parse")
+async def parse_invoice_only(
+    file: UploadFile = File(...),
+    current_user: models.UserModel = Depends(auth.get_current_user)
+):
+    """Parse a PDF invoice and return extracted fields without saving to the database."""
+    if not (file.filename and file.filename.lower().endswith(".pdf")):
+        raise HTTPException(status_code=400, detail="File type not supported must be a valid invoice")
+
+    if file.content_type:
+        ct = file.content_type.lower()
+        if ct not in ["application/pdf", "application/x-pdf", "application/octet-stream", "binary/octet-stream"]:
+            raise HTTPException(status_code=400, detail="File type not supported must be a valid invoice")
+
+    file_bytes = await file.read()
+
+    if not file_bytes or (not file_bytes.startswith(b"%PDF") and b"%PDF-" not in file_bytes[:1024]):
+        raise HTTPException(status_code=400, detail="File type not supported must be a valid invoice")
+
+    try:
+        from pypdf import PdfReader
+        import io
+        reader = PdfReader(io.BytesIO(file_bytes))
+        if len(reader.pages) == 0:
+            raise HTTPException(status_code=400, detail="File type not supported must be a valid invoice")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="File type not supported must be a valid invoice")
+
+    parsed_data = parser.parse_invoice_pdf(file_bytes)
+    if parsed_data.get("status") == "Failed":
+        detail_msg = parsed_data.get("error_message") or "File type not supported must be a valid invoice"
+        raise HTTPException(status_code=400, detail=detail_msg)
+
+    import json as _json
+
+    # Normalise line_items to list of dicts for the response
+    raw_line_items = parsed_data.get("line_items")
+    if isinstance(raw_line_items, str):
+        try:
+            raw_line_items = _json.loads(raw_line_items)
+        except Exception:
+            raw_line_items = []
+    if raw_line_items:
+        response_line_items = [
+            {
+                "description": item.get("description", "Item"),
+                "quantity": item.get("quantity", 1),
+                "unitPrice": item.get("unit_price", 0.0),
+                "total": item.get("line_total", 0.0),
+            }
+            for item in raw_line_items
+        ]
+    else:
+        amount = float(parsed_data.get("total_amount") or 0.0)
+        vendor = parsed_data.get("vendor_name") or "Vendor"
+        response_line_items = [
+            {"description": f"{vendor} — Invoice Total", "quantity": 1, "unitPrice": amount, "total": amount}
+        ]
+
+    amount = float(parsed_data.get("total_amount") or 0.0)
+    tax_amount = parsed_data.get("tax_amount")
+
+    return {
+        "vendorName": parsed_data.get("vendor_name") or "Unknown Vendor",
+        "invoiceNumber": parsed_data.get("invoice_number") or "",
+        "date": parsed_data.get("invoice_date") or "",
+        "dueDate": parsed_data.get("due_date") or "",
+        "totalAmount": amount,
+        "subtotal": parsed_data.get("subtotal"),
+        "taxAmount": tax_amount,
+        "currency": parsed_data.get("currency") or "INR",
+        "orderNumber": parsed_data.get("order_number") or "",
+        "paymentStatusOrMethod": parsed_data.get("payment_status_or_method") or "",
+        # Legacy gst key
+        "gst": tax_amount if tax_amount is not None else round(amount * 0.18, 2),
+        "lineItems": response_line_items,
+    }
+
+
+# 1b. Save endpoint — persists a (possibly user-edited) invoice payload to the DB
+class SaveInvoiceRequest(BaseModel):
+    vendorName: str
+    invoiceNumber: str
+    date: Optional[str] = None
+    dueDate: Optional[str] = None
+    totalAmount: float
+    subtotal: Optional[float] = None
+    taxAmount: Optional[float] = None
+    gst: Optional[float] = None
+    currency: str = "INR"
+    orderNumber: Optional[str] = None
+    paymentStatusOrMethod: Optional[str] = None
+    lineItems: Optional[list] = None
+
+
+@app.post("/api/invoices")
+def save_invoice(
+    payload: SaveInvoiceRequest,
+    db: Session = Depends(database.get_db),
+    current_user: models.UserModel = Depends(auth.get_current_user)
+):
+    """Save a (possibly user-edited) invoice to the database."""
+    import json as _json
+
+    # Duplicate check
+    query = db.query(models.InvoiceModel).filter(
+        models.InvoiceModel.vendor_name == payload.vendorName,
+        models.InvoiceModel.invoice_number == payload.invoiceNumber,
+    )
+    if getattr(current_user, "id", None) is not None:
+        query = query.filter(
+            (models.InvoiceModel.user_id == current_user.id) | (models.InvoiceModel.user_id.is_(None))
+        )
+    if query.first():
+        raise HTTPException(status_code=400, detail="This invoice is already uploaded.")
+
+    tax_val = payload.taxAmount if payload.taxAmount is not None else payload.gst
+
+    line_items_json = _json.dumps(
+        [
+            {
+                "description": item.get("description", "Item"),
+                "quantity": item.get("quantity", 1),
+                "unit_price": item.get("unitPrice", 0.0),
+                "line_total": item.get("total", 0.0),
+            }
+            for item in (payload.lineItems or [])
+        ]
+    )
+
+    db_invoice = models.InvoiceModel(
+        user_id=current_user.id,
+        vendor_name=payload.vendorName,
+        invoice_number=payload.invoiceNumber,
+        invoice_date=payload.date or None,
+        due_date=payload.dueDate or None,
+        total_amount=payload.totalAmount,
+        subtotal=payload.subtotal,
+        tax_amount=tax_val,
+        currency=payload.currency,
+        order_number=payload.orderNumber or None,
+        payment_status_or_method=payload.paymentStatusOrMethod or None,
+        line_items=line_items_json,
+        status="Processed",
+    )
+    db.add(db_invoice)
+    db.commit()
+    db.refresh(db_invoice)
+
+    amount = float(db_invoice.total_amount or 0.0)
+    return {
+        "message": "Invoice saved successfully",
+        "id": f"INV-{db_invoice.id}",
+        "vendor": db_invoice.vendor_name or "Unknown Vendor",
+        "vendorName": db_invoice.vendor_name or "Unknown Vendor",
+        "invoiceId": db_invoice.invoice_number or f"INV-{db_invoice.id}",
+        "invoiceNumber": db_invoice.invoice_number or f"INV-{db_invoice.id}",
+        "date": db_invoice.invoice_date or db_invoice.created_at.strftime("%Y-%m-%d"),
+        "amount": amount,
+        "totalAmount": amount,
+        "currency": db_invoice.currency or "INR",
+        "gst": db_invoice.tax_amount if db_invoice.tax_amount is not None else round(amount * 0.18, 2),
+        "status": "Processed",
+        "category": "General",
+        "lineItems": payload.lineItems or [],
+    }
+
+
+# 1c. Legacy upload endpoint — still parses AND saves in one shot (kept for compatibility)
 @app.post("/api/upload")
 async def upload_invoice(
     file: UploadFile = File(...),
@@ -242,23 +439,83 @@ async def upload_invoice(
     if parsed_data.get("status") == "Failed":
         detail_msg = parsed_data.get("error_message") or "File type not supported must be a valid invoice"
         raise HTTPException(status_code=400, detail=detail_msg)
-    
-    # Generate a unique invoice number if duplicate exists
-    existing = db.query(models.InvoiceModel).filter(models.InvoiceModel.invoice_number == parsed_data["invoice_number"]).first()
-    if existing:
-        import uuid
-        parsed_data["invoice_number"] = f"{parsed_data['invoice_number']}-{str(uuid.uuid4())[:4].upper()}"
 
-    # Save to SQLite Database
+    # 1. Before saving an uploaded invoice, query the SQLite database to check if a record
+    # with the same vendor_name AND invoice_number already exists for the user.
+    vendor_name = parsed_data.get("vendor_name")
+    invoice_number = parsed_data.get("invoice_number")
+
+    query = db.query(models.InvoiceModel).filter(
+        models.InvoiceModel.vendor_name == vendor_name,
+        models.InvoiceModel.invoice_number == invoice_number
+    )
+    if hasattr(models.InvoiceModel, "user_id") and current_user and getattr(current_user, "id", None) is not None:
+        query = query.filter(
+            (models.InvoiceModel.user_id == current_user.id) | (models.InvoiceModel.user_id.is_(None))
+        )
+
+    existing_invoice = query.first()
+
+    # 2. If it exists, abort the insert and return an HTTP 400 with the exact error message:
+    # "This invoice is already uploaded."
+    if existing_invoice:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This invoice is already uploaded."
+        )
+
+    # Serialize structured fields (tax_breakup, line_items) to JSON strings for SQLite storage
+    import json as _json
+    if isinstance(parsed_data.get("tax_breakup"), dict):
+        parsed_data["tax_breakup"] = _json.dumps(parsed_data["tax_breakup"])
+    if isinstance(parsed_data.get("line_items"), list):
+        parsed_data["line_items"] = _json.dumps(parsed_data["line_items"])
+
+    # Save to SQLite Database (only fields that exist on the model)
     db_data = {k: v for k, v in parsed_data.items() if hasattr(models.InvoiceModel, k)}
+    if hasattr(models.InvoiceModel, "user_id") and current_user and getattr(current_user, "id", None) is not None:
+        db_data["user_id"] = current_user.id
     db_invoice = models.InvoiceModel(**db_data)
     db.add(db_invoice)
     db.commit()
     db.refresh(db_invoice)
 
+    # Deserialize JSON strings back to Python objects for the response
+    def _load_json(raw):
+        if raw is None:
+            return None
+        try:
+            return _json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+
     amount = float(db_invoice.total_amount or 0.0)
-    gst = round(amount * 0.18, 2)
-    service_charge = round(amount * 0.82, 2)
+    tax_amount = db_invoice.tax_amount
+    subtotal = db_invoice.subtotal
+    tax_breakup = _load_json(db_invoice.tax_breakup)
+    line_items_parsed = _load_json(db_invoice.line_items)
+
+    # Build line_items for the response: use real extracted items if available,
+    # otherwise fall back to a single summary row.
+    if line_items_parsed:
+        response_line_items = [
+            {
+                "description": item.get("description", "Item"),
+                "quantity": item.get("quantity", 1),
+                "unitPrice": item.get("unit_price", 0.0),
+                "total": item.get("line_total", 0.0),
+            }
+            for item in line_items_parsed
+        ]
+    else:
+        response_line_items = [
+            {
+                "description": f"{db_invoice.vendor_name or 'Vendor'} — Invoice Total",
+                "quantity": 1,
+                "unitPrice": amount,
+                "total": amount,
+            }
+        ]
 
     # Return structure matching frontend ExtractedInvoice & raw data
     formatted_invoice = {
@@ -268,28 +525,24 @@ async def upload_invoice(
         "invoiceId": db_invoice.invoice_number or f"INV-{db_invoice.id}",
         "invoiceNumber": db_invoice.invoice_number or f"INV-{db_invoice.id}",
         "date": db_invoice.invoice_date or db_invoice.created_at.strftime("%Y-%m-%d"),
+        "dueDate": db_invoice.due_date,
         "amount": amount,
         "totalAmount": amount,
+        "subtotal": subtotal,
+        "taxAmount": tax_amount,
+        "taxBreakup": tax_breakup,
+        "discount": db_invoice.discount,
+        "shippingCharges": db_invoice.shipping_charges,
+        "currency": db_invoice.currency or "INR",
+        "orderNumber": db_invoice.order_number,
+        "paymentStatusOrMethod": db_invoice.payment_status_or_method,
         "status": db_invoice.status or "Processed",
         "category": "General",
-        "currency": db_invoice.currency or "INR",
-        "gst": gst,
-        "lineItems": [
-            {
-                "description": f"{db_invoice.vendor_name or 'Vendor'} Service Charge",
-                "quantity": 1,
-                "unitPrice": service_charge,
-                "total": service_charge,
-            },
-            {
-                "description": "GST (18%)",
-                "quantity": 1,
-                "unitPrice": gst,
-                "total": gst,
-            }
-        ],
+        # Legacy "gst" key kept for backward-compat — uses real tax_amount if available
+        "gst": tax_amount if tax_amount is not None else round(amount * 0.18, 2),
+        "lineItems": response_line_items,
     }
-    
+
     return {
         "message": "Invoice processed successfully",
         "data": formatted_invoice,
@@ -303,29 +556,71 @@ def get_invoices(
     db: Session = Depends(database.get_db),
     current_user: models.UserModel = Depends(auth.get_current_user)
 ):
+    import json as _json
+
+    def _load_json(raw):
+        if raw is None:
+            return None
+        try:
+            return _json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+
     invoices = db.query(models.InvoiceModel).all()
-    return [
-        {
-            "id": f"INV-{inv.id}",
-            "vendor": inv.vendor_name or "Unknown Vendor",
-            "invoiceId": inv.invoice_number or f"INV-{inv.id}",
-            "date": inv.invoice_date or inv.created_at.strftime("%Y-%m-%d"),
-            "amount": inv.total_amount or 0.0,
-            "status": inv.status or "Processed",
-            "category": "General",
-            "currency": inv.currency or "INR",
-            "gst": round((inv.total_amount or 0.0) * 0.18, 2),
-            "lineItems": [
+
+    result = []
+    for inv in invoices:
+        amount = float(inv.total_amount or 0.0)
+        tax_amount = inv.tax_amount
+        line_items_parsed = _load_json(inv.line_items)
+        tax_breakup = _load_json(inv.tax_breakup)
+
+        if line_items_parsed:
+            response_line_items = [
+                {
+                    "description": item.get("description", "Item"),
+                    "quantity": item.get("quantity", 1),
+                    "unitPrice": item.get("unit_price", 0.0),
+                    "total": item.get("line_total", 0.0),
+                }
+                for item in line_items_parsed
+            ]
+        else:
+            response_line_items = [
                 {
                     "description": "Invoice Items & Services",
                     "quantity": 1,
-                    "unitPrice": inv.total_amount or 0.0,
-                    "total": inv.total_amount or 0.0,
+                    "unitPrice": amount,
+                    "total": amount,
                 }
-            ],
-        }
-        for inv in invoices
-    ]
+            ]
+
+        result.append({
+            "id": f"INV-{inv.id}",
+            "vendor": inv.vendor_name or "Unknown Vendor",
+            "vendorName": inv.vendor_name or "Unknown Vendor",
+            "invoiceId": inv.invoice_number or f"INV-{inv.id}",
+            "invoiceNumber": inv.invoice_number or f"INV-{inv.id}",
+            "date": inv.invoice_date or inv.created_at.strftime("%Y-%m-%d"),
+            "dueDate": inv.due_date,
+            "amount": amount,
+            "totalAmount": amount,
+            "subtotal": inv.subtotal,
+            "taxAmount": tax_amount,
+            "taxBreakup": tax_breakup,
+            "discount": inv.discount,
+            "shippingCharges": inv.shipping_charges,
+            "currency": inv.currency or "INR",
+            "orderNumber": inv.order_number,
+            "paymentStatusOrMethod": inv.payment_status_or_method,
+            "status": inv.status or "Processed",
+            "category": "General",
+            # Legacy "gst" key kept for backward-compat
+            "gst": tax_amount if tax_amount is not None else round(amount * 0.18, 2),
+            "lineItems": response_line_items,
+        })
+
+    return result
 
 
 # 3. Endpoint to Delete an Invoice

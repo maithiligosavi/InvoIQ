@@ -50,8 +50,6 @@ export default function InvoicesTable({
   const [internalInvoices, setInternalInvoices] = useState<Invoice[]>([]);
   const [internalLoading, setInternalLoading] = useState(externalInvoices === undefined);
   const [internalError, setInternalError] = useState<string | null>(null);
-  const [statusFilter, setStatusFilter] = useState<InvoiceStatus | 'all'>('all');
-  const [categoryFilter, setCategoryFilter] = useState('all');
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<Invoice | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -88,23 +86,16 @@ export default function InvoicesTable({
   const errorMsg = externalError !== undefined ? externalError : internalError;
   const handleRetry = externalRetry || loadInvoices;
 
-  const categories = useMemo(
-    () => Array.from(new Set(invoices.map((i) => i.category))).sort(),
-    [invoices]
-  );
-
   const filtered = useMemo(() => {
     return invoices.filter((inv) => {
       const q = search.toLowerCase().trim();
-      const matchesSearch =
+      return (
         !q ||
         inv.vendor.toLowerCase().includes(q) ||
-        inv.invoiceId.toLowerCase().includes(q);
-      const matchesStatus = statusFilter === 'all' || inv.status === statusFilter;
-      const matchesCategory = categoryFilter === 'all' || inv.category === categoryFilter;
-      return matchesSearch && matchesStatus && matchesCategory;
+        inv.invoiceId.toLowerCase().includes(q)
+      );
     });
-  }, [invoices, search, statusFilter, categoryFilter]);
+  }, [invoices, search]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const currentPage = Math.min(page, totalPages);
@@ -209,34 +200,6 @@ export default function InvoicesTable({
               className="w-full pl-9 pr-3 py-2 text-sm rounded-lg bg-slate-100 border border-transparent outline-none placeholder:text-slate-400"
             />
           </div>
-          <select
-            value={statusFilter}
-            onChange={(e) => {
-              setStatusFilter(e.target.value as InvoiceStatus | 'all');
-              setPage(1);
-            }}
-            className="px-3 py-2 text-sm rounded-lg bg-slate-100 border border-transparent focus:bg-white focus:border-brand-300 outline-none cursor-pointer"
-          >
-            <option value="all">All Statuses</option>
-            <option value="Processed">Processed</option>
-            <option value="Pending">Pending</option>
-            <option value="Failed">Failed</option>
-          </select>
-          <select
-            value={categoryFilter}
-            onChange={(e) => {
-              setCategoryFilter(e.target.value);
-              setPage(1);
-            }}
-            className="px-3 py-2 text-sm rounded-lg bg-slate-100 border border-transparent focus:bg-white focus:border-brand-300 outline-none cursor-pointer"
-          >
-            <option value="all">All Categories</option>
-            {categories.map((c) => (
-              <option key={c} value={c}>
-                {c}
-              </option>
-            ))}
-          </select>
           <div className="sm:ml-auto flex items-center text-xs text-slate-500">
             <span>Total Live Invoices: <strong className="text-slate-800">{invoices.length}</strong></span>
           </div>
@@ -252,9 +215,7 @@ export default function InvoicesTable({
                 <th className="text-left font-semibold px-5 py-3">Invoice ID</th>
                 <th className="text-left font-semibold px-5 py-3">Date</th>
                 <th className="text-right font-semibold px-5 py-3">Amount</th>
-                <th className="text-center font-semibold px-5 py-3">Status</th>
-                <th className="text-right font-semibold px-5 py-3">Actions</th>
-              </tr>
+                <th className="text-right font-semibold px-5 py-3">Actions</th>              </tr>
             </thead>
             <tbody>
               {pageData.length === 0 ? (
@@ -390,11 +351,9 @@ function InvoiceModal({
         <div className="p-5 space-y-4">
           <div className="grid grid-cols-2 gap-3">
             <DetailField label="Vendor" value={invoice.vendor} />
-            <DetailField label="Category" value={invoice.category} />
             <DetailField label="Date" value={formatDate(invoice.date)} />
             <DetailField label="Currency" value={invoice.currency} />
             <DetailField label="GST / Tax" value={formatINR(invoice.gst)} />
-            <DetailField label="Status" value={invoice.status} />
           </div>
 
           <div className="flex items-center justify-between rounded-lg bg-brand-50 px-4 py-3">
