@@ -1,30 +1,36 @@
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
 
 import os
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-if os.path.basename(BASE_DIR).lower() == "venv":
-    BACKEND_DIR = os.path.dirname(BASE_DIR)
-else:
-    BACKEND_DIR = BASE_DIR
 
-DB_PATH = os.path.join(BACKEND_DIR, "docuflow.db")
-# SQLite database file path
-SQLALCHEMY_DATABASE_URL = f"sqlite:///{DB_PATH}"
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.engine import URL
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# Create the SQLite engine
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+load_dotenv()
+
+DATABASE_URL = URL.create(
+    drivername="postgresql+psycopg",
+    username=os.getenv("DB_USER"),
+    password=os.getenv("DB_PASSWORD"),
+    host=os.getenv("DB_HOST"),
+    port=int(os.getenv("DB_PORT", "5432")),
+    database=os.getenv("DB_NAME")
 )
 
-# Create a session maker for database interactions
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True
+)
 
-# Base class for your database models
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine
+)
+
 Base = declarative_base()
 
-# Helper dependency to get database session per request
+
 def get_db():
     db = SessionLocal()
     try:
