@@ -59,7 +59,7 @@ if HAS_SLOWAPI and _rate_limit_exceeded_handler is not None:
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ---------------------------------------------------------------------------
-# CORS — allow localhost for dev + production frontend URL from env
+# CORS — allow localhost for dev + Vercel deployment domains & custom frontend URL
 # ---------------------------------------------------------------------------
 _frontend_url = os.getenv("FRONTEND_URL", "").strip()
 _allowed_origins = [
@@ -76,7 +76,7 @@ if _frontend_url:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|.*\.vercel\.app)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -869,41 +869,33 @@ def get_analytics(
             try:
                 date_str = str(inv.invoice_date).strip()
                 parts = date_str.split("-") if "-" in date_str else date_str.split("/")
+                month_idx = None
                 if len(parts) >= 2:
-                    if len(parts[0]) == 4 and parts[1].isdigit():
-                        m_idx = int(parts[1]) - 1
-                    elif len(parts) == 3 and len(parts[2]) == 4 and parts[1].isdigit():
-                        m_idx = int(parts[1]) - 1
+                    # Check if second part is month number or name
+                    if parts[1].isdigit():
+                        m_num = int(parts[1])
+                        if 1 <= m_num <= 12:
+                            month_idx = m_num - 1
                     else:
-                        m_idx = -1
-                    if 0 <= m_idx < 12:
-                        monthly_spend_map[month_names[m_idx]] += float(inv.total_amount or 0.0)
+                        m_str = parts[1][:3].capitalize()
+                        if m_str in month_names:
+                            month_idx = month_names.index(m_str)
+                    # Also check if first part is year and second is month
+                    if month_idx is None and parts[0].isdigit() and len(parts[0]) == 4:
+                        m_num = int(parts[1])
+                        if 1 <= m_num <= 12:
+                            month_idx = m_num - 1
+                if month_idx is not None:
+                    monthly_spend_map[month_names[month_idx]] += float(inv.total_amount or 0.0)
             except Exception:
                 pass
 
-    monthly_spend = [
-        {"month": m, "spend": round(monthly_spend_map[m], 2)}
-        for m in month_names
-    ]
-    
-    # Calculate vendor spend
-    vendor_spend_map = {}
-    for inv in processed:
-        v = (inv.vendor_name or "Other").strip()
-        vendor_spend_map[v] = vendor_spend_map.get(v, 0.0) + float(inv.total_amount or 0.0)
-    
-    vendor_spend = [
-        {"vendor": v, "spend": round(amt, 2)}
-        for v, amt in sorted(vendor_spend_map.items(), key=lambda x: x[1], reverse=True)[:5]
-    ]
+    monthly_spend = [{"month": m, "amount": amt} for m, amt in monthly_spend_map.items()]
 
     return {
-        "metrics": {
-            "totalSpent": round(total_spent, 2),
-            "invoicesProcessed": len(processed),
-            "activeVendors": len(vendors),
-            "averageInvoiceValue": avg_value,
-        },
+        "totalSpent": total_spent,
+        "totalInvoices": total_count,
+        "activeVendors": len(vendors),
+        "averageInvoiceValue": avg_value,
         "monthlySpend": monthly_spend,
-        "vendorSpend": vendor_spend,
     }
