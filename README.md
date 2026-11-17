@@ -104,8 +104,12 @@ DB_HOST=localhost
 DB_PORT=5432
 DB_NAME=invoiq
 
-# Optional — override the default JWT secret in production
+# REQUIRED in production — use a long, random secret (e.g. openssl rand -hex 32)
 JWT_SECRET=your-very-secret-key
+
+# Set to "development" for local dev to allow an insecure JWT fallback if
+# JWT_SECRET is absent. Remove before deploying to production.
+ENVIRONMENT=development
 ```
 
 #### Start the backend
@@ -214,14 +218,70 @@ The `/api/analytics` endpoint returns:
 
 ## ⚙️ Environment Variables
 
+### Backend (`backend/.env`)
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DB_USER` | *(required)* | PostgreSQL username |
-| `DB_PASSWORD` | *(required)* | PostgreSQL password |
-| `DB_HOST` | `localhost` | PostgreSQL host |
-| `DB_PORT` | `5432` | PostgreSQL port |
-| `DB_NAME` | *(required)* | Database name |
-| `JWT_SECRET` | `invoiq-jwt-secret-key-2026-production-docuflow` | JWT signing secret — **change in production** |
+| `DATABASE_URL` | *(optional)* | Full Postgres connection string (e.g. `postgresql://user:pass@host:5432/dbname`). Automatically preferred over discrete `DB_*` variables. |
+| `DB_USER` | `postgres` | PostgreSQL username (used if `DATABASE_URL` is omitted). |
+| `DB_PASSWORD` | *(required)* | PostgreSQL password. |
+| `DB_HOST` | `localhost` | PostgreSQL host. |
+| `DB_PORT` | `5432` | PostgreSQL port. |
+| `DB_NAME` | `invoiq` | Database name. |
+| `JWT_SECRET` | *(required in production)* | 32+ byte random signing secret (`openssl rand -hex 32`). |
+| `ENVIRONMENT` | `production` | Set to `development` for local dev or `production` for strict validation. |
+| `FRONTEND_URL` | *(optional)* | URL of your production frontend for CORS (e.g. `https://invoiq.vercel.app`). |
+| `ENABLE_DOCS` | `false` | Set to `true` to enable `/docs` and `/redoc` in production. |
+
+### Frontend (`.env`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VITE_API_URL` | `http://localhost:8000/api` | Base URL pointing to the FastAPI backend API endpoints. |
+
+---
+
+## 🚢 Production Deployment
+
+### Option 1: Docker Compose (All-in-One)
+
+Deploy PostgreSQL, FastAPI backend, and Nginx frontend in a single command:
+
+```bash
+# 1. Clone repository
+git clone https://github.com/your-username/InvoIQ.git
+cd InvoIQ
+
+# 2. Configure environment
+cp .env.example .env
+cp backend/.env.example backend/.env
+
+# 3. Build & start containers
+docker compose up -d --build
+```
+- Frontend: `http://localhost:3000`
+- Backend API: `http://localhost:8000`
+- Health check: `http://localhost:8000/health`
+
+---
+
+### Option 2: Cloud PaaS (Frontend on Vercel + Backend on Render/Railway)
+
+1. **Database:** Create a managed PostgreSQL instance on [Supabase](https://supabase.com) or [Neon](https://neon.tech) and copy your `DATABASE_URL`.
+2. **Backend (Render / Railway):**
+   - Connect your GitHub repository and set the root directory to `backend`.
+   - Start Command: `uvicorn main:app --host 0.0.0.0 --port $PORT --workers 2`
+   - Set Environment Variables:
+     - `DATABASE_URL`: `postgresql://...`
+     - `JWT_SECRET`: `<generated 32-byte secret>`
+     - `ENVIRONMENT`: `production`
+     - `FRONTEND_URL`: `https://your-frontend.vercel.app`
+3. **Frontend (Vercel / Netlify):**
+   - Connect the repository root.
+   - Build Command: `npm run build`
+   - Output Directory: `dist`
+   - Set Environment Variable:
+     - `VITE_API_URL`: `https://your-backend.onrender.com/api`
 
 ---
 

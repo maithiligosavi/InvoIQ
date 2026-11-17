@@ -1,5 +1,11 @@
+import os
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
@@ -9,20 +15,42 @@ from models import Invoice, User, InvoiceModel, UserModel
 import parser
 import auth
 
-# Initialize FastAPI app
-app = FastAPI(title="DocuFlow Backend", version="1.0")
+# ---------------------------------------------------------------------------
+# Rate limiter (uses client IP as key)
+# ---------------------------------------------------------------------------
+limiter = Limiter(key_func=get_remote_address)
 
-# Enable CORS for your React frontend
+# ---------------------------------------------------------------------------
+# App — docs disabled unless explicitly enabled via ENABLE_DOCS=true
+# ---------------------------------------------------------------------------
+_docs_enabled = os.getenv("ENABLE_DOCS", "false").strip().lower() in ("1", "true", "yes")
+app = FastAPI(
+    title="InvoIQ Backend",
+    version="1.0",
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ---------------------------------------------------------------------------
+# CORS — allow localhost for dev + production frontend URL from env
+# ---------------------------------------------------------------------------
+_frontend_url = os.getenv("FRONTEND_URL", "").strip()
+_allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+]
+if _frontend_url:
+    _allowed_origins.insert(0, _frontend_url)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-    ],
+    allow_origins=_allowed_origins,
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
@@ -32,33 +60,6 @@ app.add_middleware(
 # Create database tables on startup (creates 'users' and 'invoices' tables if not present)
 models.Base.metadata.create_all(bind=database.engine)
 
-
-def init_db():
-    try:
-        import sqlite3
-        conn = sqlite3.connect(database.DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(invoices);")
-        columns = [col[1] for col in cursor.fetchall()]
-        if columns and "user_id" not in columns:
-            cursor.execute("ALTER TABLE invoices ADD COLUMN user_id INTEGER REFERENCES users(id);")
-            cursor.execute("UPDATE invoices SET user_id = 1 WHERE user_id IS NULL;")
-            conn.commit()
-
-        cursor.execute("CREATE INDEX IF NOT EXISTS ix_invoices_user_id ON invoices (user_id);")
-
-        cursor.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='ix_invoices_invoice_number';")
-        idx_row = cursor.fetchone()
-        if idx_row and idx_row[0] and "UNIQUE" in idx_row[0].upper():
-            cursor.execute("DROP INDEX IF EXISTS ix_invoices_invoice_number;")
-            cursor.execute("CREATE INDEX IF NOT EXISTS ix_invoices_invoice_number ON invoices (invoice_number);")
-            conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"Database schema initialization warning: {e}")
-
-
-init_db()
 
 
 # Pydantic models for authentication
@@ -89,8 +90,16 @@ def root():
 
 
 @app.get("/health")
-def health():
-    return {"status": "healthy"}
+def health(db: Session = Depends(database.get_db)):
+    try:
+        db.execute(text("SELECT 1"))
+        db_status = "connected"
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "unhealthy", "database": "disconnected", "error": str(e)},
+        )
+    return {"status": "healthy", "database": db_status}
 
 
 # ---------------------------------------------------------
@@ -98,6 +107,7 @@ def health():
 # ---------------------------------------------------------
 
 @app.post("/api/register")
+@limiter.limit("10/minute")
 async def register(request: Request, db: Session = Depends(database.get_db)):
     content_type = request.headers.get("content-type", "").lower()
     username = None
@@ -139,10 +149,10 @@ async def register(request: Request, db: Session = Depends(database.get_db)):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Username must be at least 3 characters long"
         )
-    if len(clean_password) < 4:
+    if len(clean_password) < 8:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Password must be at least 4 characters long"
+            detail="Password must be at least 8 characters long"
         )
 
     existing_user = db.query(models.UserModel).filter(models.UserModel.username == clean_username).first()
@@ -169,6 +179,7 @@ async def register(request: Request, db: Session = Depends(database.get_db)):
 
 @app.post("/api/token", response_model=TokenResponse)
 @app.post("/api/login", response_model=TokenResponse)
+@limiter.limit("20/minute")
 async def login_for_access_token(request: Request, db: Session = Depends(database.get_db)):
     content_type = request.headers.get("content-type", "").lower()
     username = None

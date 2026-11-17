@@ -9,8 +9,38 @@ from sqlalchemy.orm import Session
 import database
 import models
 
+# ---------------------------------------------------------------------------
 # JWT Configuration
-SECRET_KEY = os.environ.get("JWT_SECRET", "invoiq-jwt-secret-key-2026-production-docuflow")
+# ---------------------------------------------------------------------------
+# Resolve the runtime environment. We treat the app as "development" when
+# either ENVIRONMENT=development OR DEBUG=True (case-insensitive) is set.
+_env = os.getenv("ENVIRONMENT", "").strip().lower()
+_debug = os.getenv("DEBUG", "").strip().lower()
+_is_development = _env == "development" or _debug in ("1", "true", "yes")
+
+_JWT_SECRET_ENV = os.getenv("JWT_SECRET", "").strip()
+
+if _JWT_SECRET_ENV:
+    # Explicitly provided — always use it, regardless of environment.
+    SECRET_KEY: str = _JWT_SECRET_ENV
+elif _is_development:
+    # Development-only fallback: convenient but intentionally weak-looking so
+    # it is never mistaken for a real secret.
+    SECRET_KEY = "dev-only-insecure-secret-do-not-use-in-production"
+    import warnings
+    warnings.warn(
+        "WARNING: JWT_SECRET is not set. Using an insecure development "
+        "fallback. Set ENVIRONMENT=production and JWT_SECRET before deploying.",
+        stacklevel=1,
+    )
+else:
+    raise ValueError(
+        "CRITICAL: JWT_SECRET environment variable is missing. "
+        "Authentication cannot start securely. "
+        "Set JWT_SECRET in your environment or .env file, "
+        "or set ENVIRONMENT=development to use the insecure dev fallback."
+    )
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 
