@@ -15,22 +15,18 @@ def test_full_auth_flow():
     print("=== STARTING AUTH & SECURITY TESTS ===")
     
     # 1. Verify 'users' table exists
-    import sqlite3
-    conn = sqlite3.connect(database.DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users';")
-    row = cursor.fetchone()
-    assert row is not None, "users table does not exist in SQLite!"
-    print("✓ 'users' table verified in SQLite database.")
+    from sqlalchemy import inspect
+    inspector = inspect(database.engine)
+    tables = inspector.get_table_names()
+    assert "users" in tables, f"'users' table does not exist in database! Tables: {tables}"
+    print(f"✓ 'users' table verified in {database.engine.dialect.name} database.")
     
     # Check users table schema
-    cursor.execute("PRAGMA table_info(users);")
-    columns = {col[1]: col[2] for col in cursor.fetchall()}
-    print("  Columns:", columns)
+    columns = {col["name"]: col["type"] for col in inspector.get_columns("users")}
+    print("  Columns:", list(columns.keys()))
     assert "id" in columns
     assert "username" in columns
     assert "password_hash" in columns
-    conn.close()
 
     # 2. Test accessing protected endpoint without token
     res = client.get("/api/invoices")

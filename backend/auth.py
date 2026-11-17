@@ -1,6 +1,8 @@
 import os
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
+from dotenv import load_dotenv
 import bcrypt
 from jose import JWTError, jwt
 from fastapi import Depends, HTTPException, status, Request
@@ -8,6 +10,10 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 import database
 import models
+
+_backend_dir = Path(__file__).resolve().parent
+load_dotenv(_backend_dir / ".env")
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # JWT Configuration

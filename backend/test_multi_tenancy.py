@@ -17,14 +17,11 @@ def test_multi_tenancy():
     print("\n=== STARTING MULTI-TENANCY & DATA ISOLATION TESTS ===")
 
     # 1. Verify schema: invoices table must have user_id column
-    import sqlite3
-    conn = sqlite3.connect(database.DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("PRAGMA table_info(invoices);")
-    columns = {col[1]: col[2] for col in cursor.fetchall()}
+    from sqlalchemy import inspect
+    inspector = inspect(database.engine)
+    columns = {col["name"]: col["type"] for col in inspector.get_columns("invoices")}
     assert "user_id" in columns, "invoices table missing user_id column!"
-    print("✓ Schema verified: 'invoices' table contains 'user_id' column.")
-    conn.close()
+    print(f"✓ Schema verified: 'invoices' table contains 'user_id' column in {database.engine.dialect.name} database.")
 
     # 2. Register User A
     username_a = f"tenant_a_{uuid.uuid4().hex[:6]}"

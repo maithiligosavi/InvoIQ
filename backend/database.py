@@ -1,14 +1,18 @@
 import os
 from pathlib import Path
+import warnings
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-# Load .env from backend directory as well as root
+# Resolve backend directory and ensure .env is loaded
 _backend_dir = Path(__file__).resolve().parent
+DB_PATH = str(_backend_dir / "docuflow.db")
+
 load_dotenv(_backend_dir / ".env")
 load_dotenv()  # also load from CWD if present
+
 
 def _build_database_url():
     raw_url = os.getenv("DATABASE_URL", "").strip()
@@ -23,7 +27,7 @@ def _build_database_url():
     # Check discrete PostgreSQL parameters
     db_user = os.getenv("DB_USER")
     db_pass = os.getenv("DB_PASSWORD")
-    db_host = os.getenv("DB_HOST")
+    db_host = os.getenv("DB_HOST", "localhost")
     db_port_str = os.getenv("DB_PORT", "5432").strip()
     db_name = os.getenv("DB_NAME")
 
@@ -41,31 +45,50 @@ def _build_database_url():
             database=db_name,
         )
 
-    # Fallback: if in production, require explicit database configuration
-    env = os.getenv("ENVIRONMENT", "").strip().lower()
-    if env == "production":
+    return None
+
+
+_configured_url = _build_database_url()
+_env = os.getenv("ENVIRONMENT", "").strip().lower()
+
+engine = None
+
+if _configured_url:
+    try:
+        # Verify connection to configured database
+        _test_connect_args = {"connect_timeout": 3} if "psycopg" in str(_configured_url) else {}
+        _test_engine = create_engine(
+            _configured_url,
+            pool_pre_ping=True,
+            connect_args=_test_connect_args,
+        )
+        with _test_engine.connect() as _conn:
+            pass
+        DATABASE_URL = _configured_url
+        engine = _test_engine
+    except Exception as _e:
+        if _env == "production":
+            raise ValueError(
+                f"CRITICAL: Failed to connect to configured database in production: {_e}"
+            )
+        warnings.warn(
+            f"WARNING: Could not connect to configured database ({_e}). "
+            f"Falling back to local SQLite database at {DB_PATH}.",
+            stacklevel=1,
+        )
+
+if engine is None:
+    if _env == "production":
         raise ValueError(
             "CRITICAL: No database configuration found in production environment! "
             "Please set DATABASE_URL (or DB_USER, DB_PASSWORD, DB_HOST, DB_NAME)."
         )
-
-    # In local development without Postgres configured, fallback to SQLite
-    sqlite_path = _backend_dir / "docuflow.db"
-    return f"sqlite:///{sqlite_path.as_posix()}"
-
-
-DATABASE_URL = _build_database_url()
-
-_connect_args = {}
-_is_sqlite = str(DATABASE_URL).startswith("sqlite")
-if _is_sqlite:
-    _connect_args["check_same_thread"] = False
-
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    connect_args=_connect_args,
-)
+    DATABASE_URL = f"sqlite:///{DB_PATH}"
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        connect_args={"check_same_thread": False},
+    )
 
 SessionLocal = sessionmaker(
     autocommit=False,

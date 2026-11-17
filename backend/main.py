@@ -1,14 +1,29 @@
 import os
+from pathlib import Path
+from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
+
+_backend_dir = Path(__file__).resolve().parent
+load_dotenv(_backend_dir / ".env")
+load_dotenv()
+
+# Graceful slowapi import with no-op fallback if not installed
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    HAS_SLOWAPI = True
+except ImportError:
+    HAS_SLOWAPI = False
+    RateLimitExceeded = Exception
+    _rate_limit_exceeded_handler = None
+
 import database
 import models
 from models import Invoice, User, InvoiceModel, UserModel
@@ -18,7 +33,16 @@ import auth
 # ---------------------------------------------------------------------------
 # Rate limiter (uses client IP as key)
 # ---------------------------------------------------------------------------
-limiter = Limiter(key_func=get_remote_address)
+if HAS_SLOWAPI:
+    limiter = Limiter(key_func=get_remote_address)
+else:
+    class DummyLimiter:
+        def limit(self, *args, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+
+    limiter = DummyLimiter()
 
 # ---------------------------------------------------------------------------
 # App — docs disabled unless explicitly enabled via ENABLE_DOCS=true
@@ -31,7 +55,8 @@ app = FastAPI(
     redoc_url="/redoc" if _docs_enabled else None,
 )
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+if HAS_SLOWAPI and _rate_limit_exceeded_handler is not None:
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ---------------------------------------------------------------------------
 # CORS — allow localhost for dev + production frontend URL from env
@@ -60,6 +85,34 @@ app.add_middleware(
 # Create database tables on startup (creates 'users' and 'invoices' tables if not present)
 models.Base.metadata.create_all(bind=database.engine)
 
+
+def init_db():
+    try:
+        if database.engine.dialect.name == "sqlite":
+            import sqlite3
+            conn = sqlite3.connect(database.DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(invoices);")
+            columns = [col[1] for col in cursor.fetchall()]
+            if columns and "user_id" not in columns:
+                cursor.execute("ALTER TABLE invoices ADD COLUMN user_id INTEGER REFERENCES users(id);")
+                cursor.execute("UPDATE invoices SET user_id = 1 WHERE user_id IS NULL;")
+                conn.commit()
+
+            cursor.execute("CREATE INDEX IF NOT EXISTS ix_invoices_user_id ON invoices (user_id);")
+
+            cursor.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='ix_invoices_invoice_number';")
+            idx_row = cursor.fetchone()
+            if idx_row and idx_row[0] and "UNIQUE" in idx_row[0].upper():
+                cursor.execute("DROP INDEX IF EXISTS ix_invoices_invoice_number;")
+                cursor.execute("CREATE INDEX IF NOT EXISTS ix_invoices_invoice_number ON invoices (invoice_number);")
+                conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"Database schema initialization warning: {e}")
+
+
+init_db()
 
 
 # Pydantic models for authentication
