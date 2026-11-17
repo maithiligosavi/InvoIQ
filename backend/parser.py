@@ -605,6 +605,415 @@ def _normalize_tax_component_name(comp: str) -> str:
     return comp.upper()
 
 
+# ------------------------------------------------------------
+# Table-style invoices: tax exists only as CGST / SGST / IGST columns
+# ------------------------------------------------------------
+# Many invoices (vehicle dealers, wholesalers, ...) never print a "Total Tax" figure.
+# The tax only exists as columns of each line-item row, e.g.
+#
+#   S.NO | Model/HSN | UNIT PRICE | QTY | DISC | TAXABLE | CGST | SGST/UTGST | AMOUNT
+#   1 CHETAK C35 03/ 87116020 116,007.00 1.00 0.00 116,007.00 2,900.18 2,900.18 121,807.36
+#
+# After text extraction the column labels and the row values sit on different lines,
+# so label-based matching cannot connect them. Instead we read the decimal amounts of
+# every item row and keep the split that balances:
+#       taxable + (tax columns) = row amount
+# That arithmetic check is what makes the result trustworthy.
+
+_ROW_START_RE = re.compile(r"^\s*\d{1,3}[ \t]+\S")
+_SERIAL_RE = re.compile(r"^\s*\d{1,3}[ \t]+(?=\S)")
+# Rows that are totals / balances are never item rows
+_ROW_STOP_RE = re.compile(
+    r"\b(?:Sub\s*-?\s*Total|Total|Grand|Balance|Payable|Due)\b", re.IGNORECASE
+)
+_TOTALS_LINE_RE = re.compile(r"^\s*(?:Grand\s+)?Total\b", re.IGNORECASE)
+# Two-decimal money only (HSN codes, serial numbers and percentages are never captured)
+_ROW_MONEY_RE = re.compile(
+    r"(?<![\d,])(\d{1,3}(?:,\d{2,3})+\.\d{2}|\d+\.\d{2})(?!\d|[ \t]*%)"
+)
+# Whole-rupee fallback (used only when no row has decimal amounts). Numbers glued to
+# letters / slashes / dashes (C35, 03/, E-DRIVE, -5,000) and percentages are skipped.
+_ROW_NUM_RE = re.compile(
+    r"(?<![A-Za-z\d,./\-])(\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)"
+    r"(?![\d%/A-Za-z]|[ \t]*%)"
+)
+_GST_WORD_RE = re.compile(r"\b(?:CGST|SGST|UTGST|UGST|IGST|GST|VAT)\b", re.IGNORECASE)
+_GST_NAMES = {"CGST", "SGST", "UTGST", "IGST", "CESS"}
+
+
+def _check_split(taxable: float, taxes: list[float], amount: float):
+    """taxable + taxes must equal the row amount (±1.00) at a believable tax rate."""
+    tax_sum = sum(taxes)
+    if taxable <= 0 or tax_sum <= 0 or any(t < 0 for t in taxes):
+        return None
+    if tax_sum / taxable > 0.5:          # no GST slab (+cess) is anywhere near this
+        return None
+    if abs(taxable + tax_sum - amount) <= 1.0:
+        return taxable, list(taxes), amount
+    return None
+
+
+def _split_row_amounts(vals: list[float]) -> tuple[float, list[float], float] | None:
+    """
+    Given the numbers of one item row, return (taxable, tax_columns, amount) such that
+    taxable + sum(tax_columns) == amount. Tried layouts, in order:
+
+      taxable | tax1 | amount                     (IGST)
+      taxable | tax1 | tax2 | amount              (CGST + SGST)
+      taxable | tax1 | tax2 | tax3 | amount       (CGST + SGST + Cess)
+      taxable | rate1 | tax1 | rate2 | tax2 | amount   (rate columns printed as plain
+                                                         numbers, e.g. 9.00 not 9%)
+
+    The amount is the last number, or up to two numbers earlier when extra columns
+    (total, balance, ...) trail it. Returns None if nothing balances.
+    """
+    n = len(vals)
+    for a in range(n - 1, max(n - 4, 1), -1):
+        amount, body = vals[a], vals[:a]
+        for m in (2, 1, 3):
+            if len(body) >= m + 1:
+                hit = _check_split(body[-(m + 1)], body[-m:], amount)
+                if hit:
+                    return hit
+        for m in (2, 1):
+            if len(body) >= 2 * m + 1:
+                taxable, pairs = body[-(2 * m + 1)], body[-2 * m:]
+                rates, taxes = pairs[0::2], pairs[1::2]
+                if taxable > 0 and all(abs(r - t / taxable * 100) <= 0.15
+                                       for r, t in zip(rates, taxes)):
+                    hit = _check_split(taxable, taxes, amount)
+                    if hit:
+                        return hit
+    return None
+
+
+_SLAB_PCT = (5.0, 12.0, 18.0, 28.0)   # combined CGST+SGST rate = a GST slab
+
+
+def _split_equal_pair(vals: list[float]) -> tuple[float, list[float], None] | None:
+    """
+    CGST and SGST are always equal by law. Accept  taxable | CGST | SGST  when the pair
+    is equal and CGST+SGST is a standard GST slab of the taxable value, even if the row
+    amount does not balance (extra charge, cess, TCS, round-off, missing column...).
+    """
+    for i in range(len(vals) - 2):
+        taxable, x, y = vals[i], vals[i + 1], vals[i + 2]
+        if taxable <= 0 or x <= 0 or abs(x - y) > 0.02:
+            continue
+        rate = (x + y) / taxable * 100
+        if any(abs(rate - slab) <= 0.15 for slab in _SLAB_PCT):
+            return taxable, [x, y], None
+    return None
+
+
+def _table_component_names(text: str, m: int) -> list[str]:
+    """Name the m tax columns of an item table from the tax words in the invoice."""
+    up = text.upper()
+    has_igst = "IGST" in up
+    has_split = "CGST" in up or "SGST" in up or "UTGST" in up
+    if m == 1:
+        return ["IGST"] if has_igst else ["TAX"]
+    if m == 2:
+        if has_split:
+            return ["CGST", "SGST" if "SGST" in up or "UTGST" not in up else "UTGST"]
+        return ["TAX1", "TAX2"]
+    if has_split:
+        return ["CGST", "SGST", "IGST"] if has_igst else ["CGST", "SGST", "CESS"]
+    return ["TAX1", "TAX2", "TAX3"]
+
+
+def _snap_rate(tax: float, taxable: float) -> float | None:
+    """Tax rate (%) rounded to the nearest 0.5, or None if it isn't clearly one."""
+    if taxable <= 0:
+        return None
+    rate = tax / taxable * 100
+    snapped = round(rate * 2) / 2
+    return snapped if abs(rate - snapped) <= 0.1 else None
+
+
+def _row_values(candidate: str, integers: bool) -> list[float]:
+    if integers:
+        candidate = _SERIAL_RE.sub("", candidate, count=1)   # drop the S.NO
+        pattern = _ROW_NUM_RE
+    else:
+        pattern = _ROW_MONEY_RE
+    return [float(v.replace(",", "")) for v in pattern.findall(candidate)]
+
+
+def _find_item_rows(lines: list[str], integers: bool, pair: bool = False) -> list[tuple]:
+    """
+    All (taxable, taxes, amount) item rows found in the text. With pair=True rows are
+    accepted on the equal CGST/SGST pair alone (no amount check); those rows must
+    start with a serial number so HSN summary rows are not counted twice.
+    """
+    found: list[tuple] = []
+    skip_until = -1
+    for i, line in enumerate(lines):
+        if i < skip_until or _ROW_STOP_RE.search(line):
+            continue
+        if pair and not _ROW_START_RE.match(line):
+            continue
+        if not _row_values(line, integers):
+            continue
+        # Numbers of one row may be split over the next 1-2 lines
+        candidate, parsed, nxt = line, None, i
+        while True:
+            vals = _row_values(candidate, integers)
+            parsed = _split_equal_pair(vals) if pair else _split_row_amounts(vals)
+            if parsed or nxt - i >= 2 or nxt + 1 >= len(lines):
+                break
+            nxt += 1
+            extra = lines[nxt]
+            if _ROW_START_RE.match(extra) or _ROW_STOP_RE.search(extra):
+                parsed = None
+                break
+            candidate += " " + extra
+        if parsed:
+            found.append(parsed)
+            skip_until = nxt + 1
+    return found
+
+
+def _summary_row_tax(text: str, lines: list[str]) -> tuple | None:
+    """
+    Totals row of an invoice that has no usable item rows. Two shapes:
+      "Total 100.00 9.00 9.00 118.00"            net + taxes = gross
+      "Total 116,007.00 2,900.18 2,900.18 5,800.36"   taxable, taxes..., total tax
+    Returns (taxable, taxes, amount_or_None) or None.
+    """
+    for line in reversed(lines):
+        if not _TOTALS_LINE_RE.match(line):
+            continue
+        vals = [float(v.replace(",", "")) for v in _ROW_MONEY_RE.findall(line)]
+        if len(vals) < 3:
+            continue
+        hit = _split_row_amounts(vals)
+        if hit:
+            return hit
+        for m in (2, 1):
+            if len(vals) >= m + 2:
+                taxes, total_tax, taxable = vals[-1 - m:-1], vals[-1], vals[-2 - m]
+                if (taxable > 0 and sum(taxes) > 0 and abs(sum(taxes) - total_tax) <= 0.05
+                        and sum(taxes) / taxable <= 0.5):
+                    return taxable, taxes, None
+    return None
+
+
+def extract_table_tax(text: str) -> dict | None:
+    """
+    Total tax for invoices that never print a "Total Tax" figure: the tax only exists
+    as CGST / SGST / IGST (or generic tax) columns of the line items.
+
+    Sums the tax columns of every item row whose numbers balance
+    (taxable + tax = row amount). Falls back to a totals row when no item row parses.
+
+    Returns {"tax", "taxable", "amount", "breakup", "rows"} or None, e.g. Chetak:
+      {"tax": 5800.36, "taxable": 116007.0, "amount": 121807.36,
+       "breakup": {"CGST_2.5": 2900.18, "SGST_2.5": 2900.18}, "rows": 1}
+    """
+    if not _GST_WORD_RE.search(text):
+        return None
+
+    lines = text.splitlines()
+    parsed_rows = (
+        _find_item_rows(lines, False)
+        or _find_item_rows(lines, True)
+        or _find_item_rows(lines, False, pair=True)
+    )
+    if not parsed_rows:
+        summary = _summary_row_tax(text, lines)
+        parsed_rows = [summary] if summary else []
+    if not parsed_rows:
+        return None
+
+    breakup: dict = {}
+    taxable_total = tax_total = amount_total = 0.0
+    for taxable, taxes, amount in parsed_rows:
+        for name, amt in zip(_table_component_names(text, len(taxes)), taxes):
+            if amt <= 0:
+                continue
+            key = name
+            if name in _GST_NAMES:
+                rate = _snap_rate(amt, taxable)
+                if rate is not None:
+                    key = f"{name}_{int(rate) if float(rate).is_integer() else rate}"
+            breakup[key] = round(breakup.get(key, 0.0) + amt, 2)
+        taxable_total += taxable
+        tax_total += sum(taxes)
+        amount_total += amount or 0.0
+
+    if tax_total <= 0:
+        return None
+    return {
+        "tax": round(tax_total, 2),
+        "taxable": round(taxable_total, 2),
+        "amount": round(amount_total, 2) if amount_total else None,
+        "breakup": breakup,
+        "rows": len(parsed_rows),
+    }
+
+
+_ADJ_LABEL_RE = re.compile(r"\b(?:Incentive|Subsidy|Rebate)\b", re.IGNORECASE)
+_NEG_AMOUNT_RE = re.compile(
+    r"-[ \t]*(?:₹|Rs\.?|INR)?[ \t]*(\d{1,3}(?:,\d{2,3})*\.\d{2}|\d+\.\d{2})", re.IGNORECASE
+)
+
+
+def extract_price_adjustment(text: str) -> float | None:
+    """
+    Sum of deductions printed as negative amounts on Incentive / Subsidy / Rebate rows
+    (e.g. "PM E-DRIVE Incentive from Govt. of India -5,000.00"). Returned as a positive
+    number. The label may wrap, so the next line is searched too.
+    """
+    lines = text.splitlines()
+    total, skip_until = 0.0, -1
+    for i, line in enumerate(lines):
+        if i < skip_until or not _ADJ_LABEL_RE.search(line):
+            continue
+        m = _NEG_AMOUNT_RE.search(" ".join(lines[i:i + 2]))
+        if m:
+            total += float(m.group(1).replace(",", ""))
+            skip_until = i + 2
+    return round(total, 2) if total > 0 else None
+
+
+def _reconcile_with_table(
+    table: dict,
+    subtotal: float | None,
+    discount: float | None,
+    shipping: float | None,
+    tax: float,
+    total: float | None,
+    text: str,
+) -> tuple[float | None, float | None]:
+    """
+    On item-table invoices the printed "Sub-Total" often comes AFTER a government
+    incentive / subsidy, so subtotal + tax != total even though the tax is right.
+    Use the table's taxable value as subtotal and the incentive as discount, but only
+    when that makes the balance equation hold; otherwise leave both unchanged.
+    """
+    if total is None:
+        return subtotal, discount
+    ship = shipping or 0.0
+
+    def fits(sub: float | None, disc: float | None) -> bool:
+        return sub is not None and abs(round(sub + tax + ship - (disc or 0.0), 2) - total) <= 1.50
+
+    if fits(subtotal, discount):
+        return subtotal, discount
+    adjustment = extract_price_adjustment(text)
+    for disc in (discount, adjustment):
+        if fits(table["taxable"], disc):
+            return table["taxable"], disc
+    return subtotal, discount
+
+
+_LABEL_ONLY_RE = re.compile(
+    r"^\s*(?:Output\s+|Total\s+)?(?P<comp>CGST|SGST|UTGST|UGST|IGST"
+    r"|Central\s+(?:Tax|GST)|State\s+(?:Tax|GST)|Integrated\s+(?:Tax|GST))"
+    r"(?:[ \t]*\(?[ \t]*(?P<rate>[0-9]+(?:\.[0-9]+)?)[ \t]*%[ \t]*\)?)?"
+    r"(?:[ \t]*(?:Amount|Amt|Tax))?[ \t]*[:\-]?[ \t]*$",
+    re.IGNORECASE,
+)
+_PERCENT_ONLY_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)[ \t]*%\s*$")
+# "CGST SGST" / "CGST Amt SGST Amt": a header line with both labels and no digits
+_HEADER_PAIR_RE = re.compile(
+    r"^(?=.*\b(?:CGST|Central)\b)(?=.*\b(?:SGST|UTGST|State)\b)[^0-9]*$", re.IGNORECASE
+)
+
+
+def _component_key(component: str, rate) -> str:
+    if rate is None or rate == "":
+        return component
+    rf = float(rate)
+    return f"{component}_{int(rf) if rf.is_integer() else rf}"
+
+
+def _stacked_component_records(lines: list[str]) -> list[tuple[int, str, float]]:
+    """
+    Layouts where the label and its amount are on different lines:
+        CGST            CGST SGST
+        9%              90.00 90.00
+        ₹ 90.00
+    """
+    records: list[tuple[int, str, float]] = []
+    n = len(lines)
+    for i, line in enumerate(lines):
+        m = _LABEL_ONLY_RE.match(line)
+        if m:
+            rate = m.group("rate")
+            for j in range(i + 1, min(i + 3, n)):
+                pm = _PERCENT_ONLY_RE.match(lines[j])
+                if pm:
+                    rate = rate or pm.group(1)
+                    continue
+                if _VALUE_ONLY_LINE_RE.match(lines[j]):
+                    vals = _money_values(lines[j])
+                    if vals and vals[0] > 0:
+                        comp = _normalize_tax_component_name(m.group("comp"))
+                        records.append((i, _component_key(comp, rate), vals[0]))
+                break
+            continue
+        if _HEADER_PAIR_RE.match(line):
+            for j in range(i + 1, min(i + 3, n)):
+                vals = _money_values(lines[j])
+                if (len(vals) == 2 and not re.search(r"[A-Za-z]", lines[j])
+                        and vals[0] > 0 and abs(vals[0] - vals[1]) <= 0.02):
+                    records.append((j, "CGST", vals[0]))
+                    records.append((j, "SGST", vals[1]))
+                    break
+    return records
+
+
+def _component_records(text: str) -> list[tuple[int, str, float]]:
+    """
+    Every labelled GST component amount as (line_no, key, amount), e.g.
+    (12, "CGST_9", 45.82). If explicit "Total CGST" style summary lines exist, only
+    those are used so item rows are not double counted.
+    """
+    lines = text.splitlines()
+    has_summary_components = bool(_SUMMARY_COMPONENT_RE.search(text))
+    records: list[tuple[int, str, float]] = []
+
+    for idx, line in enumerate(lines):
+        if _COMBINED_TAX_LABEL_RE.search(line):
+            continue
+        if has_summary_components and not _SUMMARY_COMPONENT_RE.search(line):
+            continue
+        for m in _TAX_COMPONENT_RE.finditer(line):
+            component = _normalize_tax_component_name(m.group("comp"))
+            try:
+                amount = float(m.group("amt").replace(",", ""))
+            except (ValueError, AttributeError):
+                continue
+            if amount <= 0:
+                continue
+            records.append((idx, _component_key(component, m.group("rate")), round(amount, 2)))
+
+    return records or _stacked_component_records(lines)
+
+
+def _component_sum_candidates(text: str) -> list[float]:
+    """
+    CGST + SGST (+ IGST / UTGST ...) totals worth trying, best first:
+      [sum of every labelled amount, sum with exact repeats removed].
+    The second differs only when the same component amount is printed more than
+    once (item rows AND a tax summary), the usual cause of a doubled tax.
+    """
+    records = _component_records(text)
+    if not records:
+        return []
+    everything = round(sum(a for _, _, a in records), 2)
+    seen: set = set()
+    unique = 0.0
+    for _, key, amount in records:
+        if (key, amount) not in seen:
+            seen.add((key, amount))
+            unique += amount
+    unique = round(unique, 2)
+    return [everything] if unique == everything else [everything, unique]
+
+
 def extract_tax_breakup(text: str) -> dict | None:
     """
     Extract individual GST component amounts (CGST, SGST, IGST, UTGST).
@@ -612,36 +1021,37 @@ def extract_tax_breakup(text: str) -> dict | None:
 
     Only decimal amounts are accepted, so rates, serial numbers and HSN codes
     are never mistaken for tax amounts. Thousands separators ("7,169.34") work.
-    If explicit "Total CGST" style summary lines exist, only those are used so
-    item rows are not double counted.
+    Handles "CGST 9% 45.82" on one line and label / amount on separate lines. When
+    the same component amount is printed twice (item rows plus a tax summary) it is
+    counted once. If nothing is labelled, falls back to the item-table columns.
     """
     result: dict = {}
-    lines = text.splitlines()
-    has_summary_components = bool(_SUMMARY_COMPONENT_RE.search(text))
+    for _, key, amount in _dedupe_records(_component_records(text)):
+        result[key] = round(result.get(key, 0.0) + amount, 2)
+    if result:
+        return result
 
-    for line in lines:
-        if _COMBINED_TAX_LABEL_RE.search(line):
+    table = extract_table_tax(text)
+    return table["breakup"] if table and table["breakup"] else None
+
+
+def _dedupe_records(records: list[tuple[int, str, float]]) -> list[tuple[int, str, float]]:
+    """Drop exact repeats of (component, amount) only when they sit on different lines
+    AND counting them all would at least double that component."""
+    counts: dict = {}
+    for _, key, amount in records:
+        counts[(key, amount)] = counts.get((key, amount), 0) + 1
+    if not any(c > 1 for c in counts.values()):
+        return records
+    seen: set = set()
+    out = []
+    for rec in records:
+        marker = (rec[1], rec[2])
+        if marker in seen:
             continue
-        if has_summary_components and not _SUMMARY_COMPONENT_RE.search(line):
-            continue
-
-        for m in _TAX_COMPONENT_RE.finditer(line):
-            component = _normalize_tax_component_name(m.group("comp"))
-            rate = m.group("rate")
-            try:
-                amount = float(m.group("amt").replace(",", ""))
-            except (ValueError, AttributeError):
-                continue
-            if amount <= 0:
-                continue
-            if rate:
-                rf = float(rate)
-                key = f"{component}_{int(rf) if rf.is_integer() else rf}"
-            else:
-                key = component
-            result[key] = round(result.get(key, 0.0) + amount, 2)
-
-    return result if result else None
+        seen.add(marker)
+        out.append(rec)
+    return out
 
 
 def extract_tax_amount(
@@ -663,10 +1073,14 @@ def extract_tax_amount(
       2. Explicit label — "Total Tax", "Total GST", "Central Tax + State Tax",
          "Tax Amount", ... followed by a decimal amount on the same line (or on
          the next line when the label ends its line).
-      3. Component sum — CGST + SGST / IGST / UTGST from extract_tax_breakup.
-      4. Derivation — total − subtotal − shipping + discount (last resort).
+      3. Item-table columns — invoices whose tax only exists as CGST / SGST / IGST
+         columns in each line-item row (no "Total Tax" figure anywhere). Verified by
+         row arithmetic: taxable + tax columns = row amount.
+      4. Component sum — CGST + SGST / IGST / UTGST printed as labelled amounts
+         (same line or label/amount on separate lines), repeats counted once.
+      5. Derivation — total − subtotal − shipping + discount (last resort).
 
-    Candidates from steps 1-3 are rejected when subtotal and total are both known
+    Candidates from steps 1, 2 and 4 are rejected when subtotal and total are both known
     and the balance equation (±1.50) fails, so a wrong match can't win silently.
     """
     shipping = _shipping or 0.0
@@ -692,7 +1106,13 @@ def extract_tax_amount(
         vals = _money_values(line)
         if len(vals) < 2:
             continue
-        tax, gross = vals[-2], vals[-1]
+        split = _split_row_amounts(vals) if len(vals) >= 3 else None
+        if split:                        # net + CGST + SGST (+...) = gross
+            tax, gross = round(sum(split[1]), 2), split[2]
+        elif len(vals) <= 3:             # "TOTAL: <tax> <gross>"
+            tax, gross = vals[-2], vals[-1]
+        else:                            # 4+ numbers that don't balance: ambiguous
+            continue
         if tax <= 0 or tax >= gross:
             continue
         if _total_amount is not None and abs(gross - _total_amount) > tol:
@@ -718,14 +1138,27 @@ def extract_tax_amount(
             if tax > 0 and _balanced(tax):
                 return tax
 
-    # ---- 3. Component sum ---------------------------------------------
-    breakup = extract_tax_breakup(text)
-    if breakup:
-        comp_sum = round(sum(breakup.values()), 2)
-        if comp_sum > 0 and _balanced(comp_sum):
-            return comp_sum
+    # ---- 3. Item-table columns (CGST / SGST / IGST per line item) ------
+    # Already verified by the row arithmetic (taxable + tax = row amount), so the
+    # subtotal-based balance check is skipped: such invoices can carry incentives or
+    # subsidies that legitimately break  subtotal + tax = total.
+    table = extract_table_tax(text)
+    if table and table["tax"] > 0:
+        return table["tax"]
 
-    # ---- 4. Derivation -------------------------------------------------
+    # ---- 4. Component sum: CGST + SGST (+ IGST / UTGST) ---------------
+    # Prefer a total that balances against subtotal/total. If none does, the invoice
+    # carries other adjustments (TCS, round-off, incentive...), and the explicit sum
+    # of the printed tax amounts is still more trustworthy than total - subtotal;
+    # validate_invoice() flags the imbalance for review.
+    candidates = [c for c in _component_sum_candidates(text) if c > 0]
+    for comp_sum in candidates:
+        if _balanced(comp_sum):
+            return comp_sum
+    if candidates:
+        return candidates[-1]
+
+    # ---- 5. Derivation -------------------------------------------------
     if _subtotal is not None and _total_amount is not None and _total_amount > _subtotal > 0:
         derived = round(_total_amount - _subtotal - shipping + discount, 2)
         if 0 < derived <= _subtotal * 0.5:
@@ -1030,7 +1463,20 @@ def parse_invoice_text(extracted_text: str) -> dict:
         discount,
     )
     tax_breakup              = _safe(extract_tax_breakup,              extracted_text)
-    due_date                 = _safe(extract_due_date,                 extracted_text)
+
+    # Item-table invoices: the printed Sub-Total can come after an incentive/subsidy,
+    # so reconcile subtotal / discount with the table's taxable value.
+    table = _safe(extract_table_tax, extracted_text)
+    if table and tax_amount is not None and abs(tax_amount - table["tax"]) <= 0.01:
+        try:
+            subtotal, discount = _reconcile_with_table(
+                table, subtotal, discount, shipping_charges,
+                tax_amount, total_amount, extracted_text,
+            )
+        except Exception:
+            pass
+
+    due_date                = _safe(extract_due_date,                 extracted_text)
     order_number             = _safe(extract_order_number,             extracted_text)
     payment_status_or_method = _safe(extract_payment_status_or_method, extracted_text)
     line_items               = _safe(extract_line_items,              extracted_text)
@@ -1068,6 +1514,13 @@ def parse_invoice_text(extracted_text: str) -> dict:
     validation_result = validate_invoice(extracted)
     missing_fields    = validation_result["missing_fields"]
     validation_errors = validation_result["validation_errors"]
+
+    # The invoice talks about GST/VAT but no tax amount could be found. Flag it
+    # for review rather than letting a missing value pass (or be guessed) downstream.
+    if tax_amount is None and _GST_WORD_RE.search(extracted_text):
+        validation_errors = validation_errors + [
+            "Tax amount could not be determined although the invoice mentions GST/VAT"
+        ]
 
     return {
         **extracted,
