@@ -17,11 +17,11 @@ load_dotenv()  # also load from CWD if present
 def _build_database_url():
     raw_url = os.getenv("DATABASE_URL", "").strip()
     if raw_url:
-        # Standardize cloud Postgres URL to use psycopg 3 driver
+        # Standardize cloud Postgres URL to use psycopg2 driver for Render compatibility
         if raw_url.startswith("postgres://"):
-            return raw_url.replace("postgres://", "postgresql+psycopg://", 1)
+            return raw_url.replace("postgres://", "postgresql+psycopg2://", 1)
         if raw_url.startswith("postgresql://") and not raw_url.startswith("postgresql+"):
-            return raw_url.replace("postgresql://", "postgresql+psycopg://", 1)
+            return raw_url.replace("postgresql://", "postgresql+psycopg2://", 1)
         return raw_url
 
     # Check discrete PostgreSQL parameters
@@ -37,7 +37,7 @@ def _build_database_url():
         except ValueError:
             port = 5432
         return URL.create(
-            drivername="postgresql+psycopg",
+            drivername="postgresql+psycopg2",
             username=db_user,
             password=db_pass,
             host=db_host,
