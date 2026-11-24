@@ -160,6 +160,7 @@ def health(db: Session = Depends(database.get_db)):
 # ---------------------------------------------------------
 
 @app.post("/api/register")
+@app.post("/register")
 @limiter.limit("10/minute")
 async def register(request: Request, db: Session = Depends(database.get_db)):
     content_type = request.headers.get("content-type", "").lower()
