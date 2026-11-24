@@ -230,7 +230,8 @@ async def register(request: Request, db: Session = Depends(database.get_db)):
         "username": new_user.username
     }
 
-
+@app.post("/token")
+@app.post("/login")
 @app.post("/api/token", response_model=TokenResponse)
 @app.post("/api/login", response_model=TokenResponse)
 @limiter.limit("20/minute")
